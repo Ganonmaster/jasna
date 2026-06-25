@@ -1,5 +1,6 @@
 """Background processor for video processing jobs."""
 
+import logging
 import threading
 import traceback
 import queue
@@ -10,6 +11,8 @@ from typing import Callable
 
 from jasna.gui.models import JobItem, JobStatus, AppSettings
 from jasna.media import UnsupportedColorspaceError
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -382,6 +385,21 @@ class Processor:
                 total_frames=total,
             ))
 
+        from jasna.media.vr_detect import resolve_vr_config
+        vr_config, vr_detected = resolve_vr_config(
+            str(input_path),
+            mode=settings.vr_mode,
+            input_projection=settings.vr_input_projection,
+            output_projection=settings.vr_output_projection,
+            layout=settings.vr_layout,
+            eye=settings.vr_eye,
+            mosaic_space=settings.vr_mosaic_space,
+            fov_deg=(settings.vr_fov_deg or None),
+        )
+        if vr_detected is not None:
+            log.info("VR detect: %s", vr_detected.summary())
+        log.info("VR config: %s", vr_config.describe() if vr_config else "disabled")
+
         pipeline = None
         try:
             pipeline = Pipeline(
@@ -398,8 +416,7 @@ class Processor:
                 max_clip_size=settings.max_clip_size,
                 temporal_overlap=settings.temporal_overlap,
                 enable_crossfade=settings.enable_crossfade,
-                fisheye_remap=settings.fisheye_remap,
-                reproject_to_source=settings.reproject_to_source,
+                vr_config=vr_config,
                 fp16=settings.fp16_mode,
                 disable_progress=True,
                 progress_callback=progress_callback,

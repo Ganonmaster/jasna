@@ -23,17 +23,34 @@ def _torch_pad_reflect(image: torch.Tensor, paddings: tuple[int, int, int, int])
     return image
 
 
+def _eye_bounds(cx: float, cy: float, layout: str, frame_h: int, frame_w: int) -> tuple[int, int, int, int]:
+    """Sub-rectangle (x_lo, y_lo, x_hi, y_hi) of the stereo eye containing point (cx, cy).
+
+    Keeps crops from straddling the stereo seam (TB: y=H/2, SBS: x=W/2) and pulling
+    pixels from the other eye. 'mono'/unknown -> the full frame (no constraint).
+    """
+    if layout == "tb":
+        mid = frame_h // 2
+        return (0, 0, frame_w, mid) if cy < frame_h / 2 else (0, mid, frame_w, frame_h)
+    if layout == "sbs":
+        mid = frame_w // 2
+        return (0, 0, mid, frame_h) if cx < frame_w / 2 else (mid, 0, frame_w, frame_h)
+    return 0, 0, frame_w, frame_h
+
+
 def expand_bbox(
     x1: int, y1: int, x2: int, y2: int, frame_h: int, frame_w: int,
+    bounds: tuple[int, int, int, int] | None = None,
 ) -> tuple[int, int, int, int]:
+    bx_lo, by_lo, bx_hi, by_hi = bounds if bounds is not None else (0, 0, frame_w, frame_h)
     w = x2 - x1
     h = y2 - y1
 
     border = max(MIN_BORDER, int(max(w, h) * BORDER_RATIO)) if BORDER_RATIO > 0.0 else 0
-    x1_exp = max(0, x1 - border)
-    y1_exp = max(0, y1 - border)
-    x2_exp = min(frame_w, x2 + border)
-    y2_exp = min(frame_h, y2 + border)
+    x1_exp = max(bx_lo, x1 - border)
+    y1_exp = max(by_lo, y1 - border)
+    x2_exp = min(bx_hi, x2 + border)
+    y2_exp = min(by_hi, y2 + border)
 
     w = x2_exp - x1_exp
     h = y2_exp - y1_exp
@@ -44,10 +61,10 @@ def expand_bbox(
     missing_w = int((RESTORATION_SIZE - (w * down_scale_factor)) / down_scale_factor) if down_scale_factor > 0 else 0
     missing_h = int((RESTORATION_SIZE - (h * down_scale_factor)) / down_scale_factor) if down_scale_factor > 0 else 0
 
-    available_w_l = x1_exp
-    available_w_r = frame_w - x2_exp
-    available_h_t = y1_exp
-    available_h_b = frame_h - y2_exp
+    available_w_l = x1_exp - bx_lo
+    available_w_r = bx_hi - x2_exp
+    available_h_t = y1_exp - by_lo
+    available_h_b = by_hi - y2_exp
 
     budget_w = int(MAX_EXPANSION_FACTOR * w)
     budget_h = int(MAX_EXPANSION_FACTOR * h)
@@ -73,10 +90,10 @@ def expand_bbox(
     y1_exp = y1_exp - math.floor(expand_h_tb / 2) - expand_h_t
     y2_exp = y2_exp + math.ceil(expand_h_tb / 2) + expand_h_b
 
-    x1_exp = max(0, min(int(x1_exp), frame_w))
-    x2_exp = max(0, min(int(x2_exp), frame_w))
-    y1_exp = max(0, min(int(y1_exp), frame_h))
-    y2_exp = max(0, min(int(y2_exp), frame_h))
+    x1_exp = max(bx_lo, min(int(x1_exp), bx_hi))
+    x2_exp = max(bx_lo, min(int(x2_exp), bx_hi))
+    y1_exp = max(by_lo, min(int(y1_exp), by_hi))
+    y2_exp = max(by_lo, min(int(y2_exp), by_hi))
 
     return x1_exp, y1_exp, x2_exp, y2_exp
 
@@ -110,17 +127,25 @@ def extract_crop(
     bbox: np.ndarray,
     frame_h: int,
     frame_w: int,
+    stereo_layout: str = "mono",
 ) -> RawCrop:
+    # Constrain the crop to the stereo eye the detection sits in, so an enlarged crop
+    # never straddles the seam and pulls the other eye's pixels (mono -> full frame).
+    cx = (float(bbox[0]) + float(bbox[2])) * 0.5
+    cy = (float(bbox[1]) + float(bbox[3])) * 0.5
+    bx_lo, by_lo, bx_hi, by_hi = _eye_bounds(cx, cy, stereo_layout, frame_h, frame_w)
+
     x1 = int(np.floor(bbox[0]))
     y1 = int(np.floor(bbox[1]))
     x2 = int(np.ceil(bbox[2]))
     y2 = int(np.ceil(bbox[3]))
-    x1 = max(0, min(x1, frame_w))
-    y1 = max(0, min(y1, frame_h))
-    x2 = max(0, min(x2, frame_w))
-    y2 = max(0, min(y2, frame_h))
+    x1 = max(bx_lo, min(x1, bx_hi))
+    y1 = max(by_lo, min(y1, by_hi))
+    x2 = max(bx_lo, min(x2, bx_hi))
+    y2 = max(by_lo, min(y2, by_hi))
 
-    x1_exp, y1_exp, x2_exp, y2_exp = expand_bbox(x1, y1, x2, y2, frame_h, frame_w)
+    x1_exp, y1_exp, x2_exp, y2_exp = expand_bbox(
+        x1, y1, x2, y2, frame_h, frame_w, bounds=(bx_lo, by_lo, bx_hi, by_hi))
     if frame.device.type == "cpu":
         crop = torch.from_numpy(np.array(frame.numpy()[:, y1_exp:y2_exp, x1_exp:x2_exp]))
     else:

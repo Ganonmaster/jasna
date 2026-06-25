@@ -118,6 +118,7 @@ def process_frame_batch(
     metadata_queue: Queue[FrameMeta | object],
     discard_margin: int,
     blend_frames: int = 0,
+    stereo_layout: str = "mono",
 ) -> BatchProcessResult:
     effective_bs = len(pts_list)
     if effective_bs == 0:
@@ -149,7 +150,7 @@ def process_frame_batch(
                 continue
             if track_id not in crop_buffers:
                 crop_buffers[track_id] = CropBuffer(track_id=track_id, start_frame=clip.start_frame)
-            raw_crop = extract_crop(frame, clip.bboxes[-1], frame_h, frame_w)
+            raw_crop = extract_crop(frame, clip.bboxes[-1], frame_h, frame_w, stereo_layout)
             crop_buffers[track_id].add(raw_crop)
 
         for ec in ended_clips:
@@ -157,7 +158,7 @@ def process_frame_batch(
             if tid not in crop_buffers:
                 crop_buffers[tid] = CropBuffer(track_id=tid, start_frame=ec.clip.start_frame)
             if crop_buffers[tid].frame_count < ec.clip.frame_count:
-                raw_crop = extract_crop(frame, ec.clip.bboxes[-1], frame_h, frame_w)
+                raw_crop = extract_crop(frame, ec.clip.bboxes[-1], frame_h, frame_w, stereo_layout)
                 crop_buffers[tid].add(raw_crop)
 
         clips_emitted += len(ended_clips)

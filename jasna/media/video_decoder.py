@@ -25,12 +25,17 @@ def _create_blocking_cuda_stream() -> int:
 
 
 class NvidiaVideoReader:
-    def __init__(self, file: str, batch_size: int, device: torch.device, metadata: VideoMetadata, fisheye_remap: bool = False):
+    def __init__(self, file: str, batch_size: int, device: torch.device, metadata: VideoMetadata,
+                 fisheye_remap: bool = False, vr_layout: str = "sbs",
+                 vr_eye_hfov: float = 180.0, vr_fov_deg: float = 180.0):
         self.device = device
         self.file = file
         self.batch_size = batch_size
         self.metadata = metadata
         self.fisheye_remap = bool(fisheye_remap)
+        self.vr_layout = vr_layout
+        self.vr_eye_hfov = float(vr_eye_hfov)
+        self.vr_fov_deg = float(vr_fov_deg)
         self._remapper = None
 
     def __enter__(self):
@@ -95,7 +100,9 @@ class NvidiaVideoReader:
             self._dither2 = torch.floor(t * 4.0).to(torch.int32)
 
         if self.fisheye_remap:
-            self._remapper = FisheyeRemapper(self.decoder.Width, self.decoder.Height, self.device)
+            self._remapper = FisheyeRemapper(self.decoder.Width, self.decoder.Height, self.device,
+                                             layout=self.vr_layout, eye_hfov=self.vr_eye_hfov,
+                                             fov_deg=self.vr_fov_deg)
 
         return self
 

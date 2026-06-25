@@ -13,6 +13,7 @@ from jasna.crop_buffer import CropBuffer
 from jasna.frame_queue import FrameQueue
 from jasna.media.video_decoder import NvidiaVideoReader
 from jasna.media.fisheye_remap import FisheyeRemapper, InverseFisheyeRemapper
+from jasna.media.vr_detect import VRConfig
 from jasna.pipeline_debug_logging import PipelineDebugMemoryLogger
 from jasna.pipeline_items import ClipRestoreItem, FrameMeta, PrimaryRestoreResult, SecondaryRestoreResult, _SENTINEL
 from jasna.pipeline_processing import process_frame_batch, finalize_processing
@@ -29,6 +30,47 @@ class FrameWriter(Protocol):
     def after_write(self, frames_written: int) -> None: ...
 
 
+def _blank_other_eye(frames: torch.Tensor, layout: str, eye: str) -> None:
+    """Zero the non-selected eye in place (N,3,H,W) so detection/restoration skip it.
+
+    Single-eye mode: eye='left' keeps the first eye (SBS left / TB top), 'right' the
+    second. The other eye gets the restored eye copied over it at encode time.
+    """
+    h, w = frames.shape[-2:]
+    if layout == "tb":
+        if eye == "left":      # keep top eye, blank bottom
+            frames[..., h // 2:, :] = 0
+        else:                  # keep bottom eye, blank top
+            frames[..., :h // 2, :] = 0
+    elif layout == "sbs":
+        if eye == "left":      # keep left eye, blank right
+            frames[..., :, w // 2:] = 0
+        else:                  # keep right eye, blank left
+            frames[..., :, :w // 2] = 0
+
+
+def _duplicate_eye(frame: torch.Tensor, layout: str, eye: str) -> torch.Tensor:
+    """Copy the selected eye onto the other (3,H,W). Single-eye output: the 3D parallax
+    is dropped (both eyes identical) in exchange for half the work.
+
+    Returns a fresh tensor: `frame` may be an inference tensor (from the remapper / reader),
+    which torch forbids mutating in place outside inference_mode, so we clone first.
+    """
+    out = frame.clone()
+    h, w = out.shape[-2:]
+    if layout == "tb":
+        if eye == "left":
+            out[:, h // 2:, :] = out[:, :h // 2, :]
+        else:
+            out[:, :h // 2, :] = out[:, h // 2:, :]
+    elif layout == "sbs":
+        if eye == "left":
+            out[:, :, w // 2:] = out[:, :, :w // 2]
+        else:
+            out[:, :, :w // 2] = out[:, :, w // 2:]
+    return out
+
+
 def decode_detect_loop(
     *,
     input_video: str,
@@ -39,7 +81,7 @@ def decode_detect_loop(
     max_clip_size: int,
     temporal_overlap: int,
     enable_crossfade: bool,
-    fisheye_remap: bool = False,
+    vr_config: VRConfig | None = None,
     blend_buffer: BlendBuffer,
     crop_buffers: dict[int, CropBuffer],
     clip_queue: FrameQueue,
@@ -58,8 +100,19 @@ def decode_detect_loop(
         discard_margin = temporal_overlap
         blend_frames = (temporal_overlap // 3) if enable_crossfade else 0
 
+        remap_on_decode = vr_config is not None and vr_config.remap_on_decode
+        vr_layout = vr_config.layout if vr_config is not None else "mono"
+        vr_eye = vr_config.eye if vr_config is not None else "both"
+        vr_eye_hfov = vr_config.eye_hfov if vr_config is not None else 180.0
+        vr_fov = vr_config.fov_deg if vr_config is not None else 180.0
+        single_eye = vr_eye != "both" and vr_layout in ("sbs", "tb")
+
         with (
-            NvidiaVideoReader(input_video, batch_size=batch_size, device=device, metadata=metadata, fisheye_remap=fisheye_remap) as reader,
+            NvidiaVideoReader(
+                input_video, batch_size=batch_size, device=device, metadata=metadata,
+                fisheye_remap=remap_on_decode, vr_layout=vr_layout,
+                vr_eye_hfov=vr_eye_hfov, vr_fov_deg=vr_fov,
+            ) as reader,
             torch.inference_mode(),
         ):
             if progress is not None:
@@ -89,6 +142,9 @@ def decode_detect_loop(
                     if error_holder:
                         raise error_holder[0]
 
+                    if single_eye:
+                        _blank_other_eye(frames, vr_layout, vr_eye)
+
                     batch_start = frame_idx
 
                     with timer.measure("detect-track"):
@@ -106,6 +162,7 @@ def decode_detect_loop(
                             metadata_queue=metadata_queue,
                             discard_margin=discard_margin,
                             blend_frames=blend_frames,
+                            stereo_layout=vr_layout,
                         )
 
                     frame_idx = res.next_frame_idx
@@ -270,8 +327,7 @@ def blend_encode_loop(
     metadata_queue: Queue,
     error_holder: list[BaseException],
     frame_writer: FrameWriter,
-    fisheye_remap: bool = False,
-    reproject_to_source: bool = False,
+    vr_config: VRConfig | None = None,
     cancel_event: threading.Event | None = None,
     seek_ts: float | None = None,
     vram_offloader=None,
@@ -280,22 +336,38 @@ def blend_encode_loop(
     try:
         torch.cuda.set_device(device)
 
+        remap_on_decode = vr_config is not None and vr_config.remap_on_decode
+        reproject = vr_config is not None and vr_config.reproject_on_encode
+        vr_layout = vr_config.layout if vr_config is not None else "sbs"
+        vr_eye_hfov = vr_config.eye_hfov if vr_config is not None else 180.0
+        vr_fov = vr_config.fov_deg if vr_config is not None else 180.0
+        vr_eye = vr_config.eye if vr_config is not None else "both"
+        single_eye = vr_eye != "both" and vr_layout in ("sbs", "tb")
+
         # Reproject-to-source: process in fisheye but export in the source (VR180)
         # projection. reader2 (below) decodes the SOURCE equirect, so frames with no
         # detections pass straight through untouched (no remap). Only frames that
         # actually have restorations are round-tripped: equirect -> fisheye (forward,
         # identical grid to detection) -> blend the fisheye crops -> fisheye -> equirect.
         forward_remapper = inverse_remapper = None
-        if fisheye_remap and reproject_to_source:
-            forward_remapper = FisheyeRemapper(metadata.video_width, metadata.video_height, device)
-            inverse_remapper = InverseFisheyeRemapper(metadata.video_width, metadata.video_height, device)
+        if remap_on_decode and reproject:
+            forward_remapper = FisheyeRemapper(
+                metadata.video_width, metadata.video_height, device,
+                layout=vr_layout, eye_hfov=vr_eye_hfov, fov_deg=vr_fov)
+            inverse_remapper = InverseFisheyeRemapper(
+                metadata.video_width, metadata.video_height, device,
+                layout=vr_layout, eye_hfov=vr_eye_hfov, fov_deg=vr_fov)
 
         def _flat_frames(rdr: NvidiaVideoReader):
             for batch, pts in rdr.frames(seek_ts=seek_ts):
                 for i in range(len(pts)):
                     yield batch[i]
 
-        with NvidiaVideoReader(input_video, batch_size=batch_size, device=device, metadata=metadata, fisheye_remap=(fisheye_remap and not reproject_to_source)) as reader2:
+        with NvidiaVideoReader(
+            input_video, batch_size=batch_size, device=device, metadata=metadata,
+            fisheye_remap=(remap_on_decode and not reproject),
+            vr_layout=vr_layout, vr_eye_hfov=vr_eye_hfov, vr_fov_deg=vr_fov,
+        ) as reader2:
             frame_gen = _flat_frames(reader2)
             secondary_done = False
             frames_encoded = 0
@@ -353,6 +425,8 @@ def blend_encode_loop(
                     else:
                         # no restoration (or not reproject mode): no remap, source passthrough
                         blended = blend_buffer.blend_frame(meta.frame_idx, original_frame)
+                    if single_eye:
+                        blended = _duplicate_eye(blended, vr_layout, vr_eye)
                 with timer.measure("write"):
                     frame_writer.write(blended, meta.pts)
                     frames_encoded += 1

@@ -261,6 +261,7 @@ class SettingsPanel(ctk.CTkFrame):
     def _build_sections(self):
         self._build_basic_section()
         self._build_advanced_section()
+        self._build_vr_section()
         self._build_secondary_section()
         self._build_image_restoration_section()
         self._build_encoding_section()
@@ -453,41 +454,7 @@ class SettingsPanel(ctk.CTkFrame):
         self._widgets["enable_crossfade"].pack(side="right", padx=12, pady=8)
         self._widgets["enable_crossfade"].select()
 
-        # Fisheye remap (VR180) toggle
-        row_fisheye = ctk.CTkFrame(inner, fg_color="transparent")
-        row_fisheye.pack(fill="x", pady=(0, Sizing.PADDING_SMALL))
-
-        fisheye_frame = ctk.CTkFrame(row_fisheye, fg_color=Colors.BG_CARD, corner_radius=6)
-        fisheye_frame.pack(fill="x")
-        fisheye_label = ctk.CTkLabel(fisheye_frame, text=t("fisheye_remap"), text_color=Colors.TEXT_PRIMARY, font=(Fonts.FAMILY, Fonts.SIZE_NORMAL))
-        fisheye_label.pack(side="left", padx=12, pady=8)
-        fisheye_tip = ctk.CTkLabel(fisheye_frame, text="ⓘ", text_color=Colors.TEXT_PRIMARY, font=(Fonts.FAMILY, Fonts.SIZE_TINY), cursor="hand2")
-        fisheye_tip.pack(side="left")
-        Tooltip(fisheye_tip, get_tooltip("fisheye_remap"))
-        self._widgets["fisheye_remap"] = ctk.CTkSwitch(
-            fisheye_frame, text="", fg_color=Colors.BORDER_LIGHT, progress_color=Colors.PRIMARY,
-            command=lambda: self._on_toggle_change("fisheye_remap")
-        )
-        self._widgets["fisheye_remap"].pack(side="right", padx=12, pady=8)
-        self._widgets["fisheye_remap"].deselect()
-
-        # Reproject restored result back to source (VR180) projection
-        row_reproject = ctk.CTkFrame(inner, fg_color="transparent")
-        row_reproject.pack(fill="x", pady=(0, Sizing.PADDING_SMALL))
-
-        reproject_frame = ctk.CTkFrame(row_reproject, fg_color=Colors.BG_CARD, corner_radius=6)
-        reproject_frame.pack(fill="x")
-        reproject_label = ctk.CTkLabel(reproject_frame, text=t("reproject_to_source"), text_color=Colors.TEXT_PRIMARY, font=(Fonts.FAMILY, Fonts.SIZE_NORMAL))
-        reproject_label.pack(side="left", padx=12, pady=8)
-        reproject_tip = ctk.CTkLabel(reproject_frame, text="ⓘ", text_color=Colors.TEXT_PRIMARY, font=(Fonts.FAMILY, Fonts.SIZE_TINY), cursor="hand2")
-        reproject_tip.pack(side="left")
-        Tooltip(reproject_tip, get_tooltip("reproject_to_source"))
-        self._widgets["reproject_to_source"] = ctk.CTkSwitch(
-            reproject_frame, text="", fg_color=Colors.BORDER_LIGHT, progress_color=Colors.PRIMARY,
-            command=lambda: self._on_toggle_change("reproject_to_source")
-        )
-        self._widgets["reproject_to_source"].pack(side="right", padx=12, pady=8)
-        self._widgets["reproject_to_source"].deselect()
+        # (VR fisheye/reproject controls moved to the dedicated "VR Settings" section)
 
         # Denoising Strength
         row3 = ctk.CTkFrame(inner, fg_color="transparent")
@@ -544,6 +511,94 @@ class SettingsPanel(ctk.CTkFrame):
         )
         self._widgets["denoise_step"].pack(side="right")
         self._widgets["denoise_step"].set(t("after_primary"))
+
+    @staticmethod
+    def _vr_display(value_map: dict, internal: str) -> str:
+        for disp, val in value_map.items():
+            if val == internal:
+                return disp
+        return next(iter(value_map))
+
+    @staticmethod
+    def _parse_float(s, default: float) -> float:
+        try:
+            return float(str(s).strip() or default)
+        except (TypeError, ValueError):
+            return default
+
+    def _vr_dropdown(self, parent, key: str, value_map: dict, default_internal: str):
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", pady=(0, Sizing.PADDING_SMALL))
+        label = ctk.CTkLabel(row, text=t(key), text_color=Colors.TEXT_PRIMARY, font=(Fonts.FAMILY, Fonts.SIZE_NORMAL))
+        label.pack(side="left")
+        tip = ctk.CTkLabel(row, text="ⓘ", text_color=Colors.TEXT_PRIMARY, font=(Fonts.FAMILY, Fonts.SIZE_TINY), cursor="hand2")
+        tip.pack(side="left", padx=4)
+        Tooltip(tip, get_tooltip(key))
+        widget = ctk.CTkOptionMenu(
+            row, values=list(value_map.keys()),
+            fg_color=Colors.BG_CARD, button_color=Colors.BG_CARD,
+            button_hover_color=Colors.BORDER_LIGHT, dropdown_fg_color=Colors.BG_CARD,
+            dropdown_hover_color=Colors.PRIMARY, text_color=Colors.TEXT_PRIMARY,
+            width=170, command=lambda v, k=key, m=value_map: self._on_vr_dropdown(k, m[v]),
+        )
+        widget.pack(side="right")
+        widget.set(self._vr_display(value_map, default_internal))
+        self._widgets[key] = widget
+
+    def _on_vr_dropdown(self, key: str, value: str):
+        self._on_setting_change(key, value)
+        if key == "vr_mode":
+            self._on_vr_mode_changed()
+
+    def _on_vr_mode_changed(self):
+        self._vr_options_frame.pack_forget()
+        internal = self._vr_mode_values.get(self._widgets["vr_mode"].get(), "auto")
+        if internal != "off":
+            self._vr_options_frame.pack(fill="x", pady=(Sizing.PADDING_SMALL, 0))
+
+    def _build_vr_section(self):
+        section = CollapsibleSection(self._scroll, t("section_vr"), expanded=False)
+        section.pack(fill="x", pady=(0, Sizing.PADDING_SMALL))
+        content = section.content
+        content.configure(corner_radius=Sizing.BORDER_RADIUS)
+
+        inner = ctk.CTkFrame(content, fg_color="transparent")
+        inner.pack(fill="x", padx=Sizing.PADDING_MEDIUM, pady=Sizing.PADDING_MEDIUM)
+
+        # Mode (always visible)
+        self._vr_mode_values = {t("vr_mode_auto"): "auto", t("vr_mode_on"): "on", t("vr_mode_off"): "off"}
+        self._vr_dropdown(inner, "vr_mode", self._vr_mode_values, "auto")
+
+        # Sub-options (shown only when mode != off)
+        self._vr_options_frame = ctk.CTkFrame(inner, fg_color=Colors.BG_CARD, corner_radius=6)
+        opt = ctk.CTkFrame(self._vr_options_frame, fg_color="transparent")
+        opt.pack(fill="x", padx=12, pady=12)
+
+        self._vr_input_proj_values = {t("vr_proj_auto"): "auto", t("vr_proj_equirect"): "equirect", t("vr_proj_fisheye"): "fisheye"}
+        self._vr_dropdown(opt, "vr_input_projection", self._vr_input_proj_values, "auto")
+        self._vr_output_proj_values = {t("vr_out_source"): "source", t("vr_out_equirect"): "equirect", t("vr_out_fisheye"): "fisheye"}
+        self._vr_dropdown(opt, "vr_output_projection", self._vr_output_proj_values, "source")
+        self._vr_layout_values = {t("vr_layout_auto"): "auto", t("vr_layout_sbs"): "sbs", t("vr_layout_tb"): "tb", t("vr_layout_mono"): "mono"}
+        self._vr_dropdown(opt, "vr_layout", self._vr_layout_values, "auto")
+        self._vr_eye_values = {t("vr_eye_both"): "both", t("vr_eye_left"): "left", t("vr_eye_right"): "right"}
+        self._vr_dropdown(opt, "vr_eye", self._vr_eye_values, "both")
+        self._vr_mosaic_space_values = {t("vr_space_auto"): "auto", t("vr_space_fisheye"): "fisheye", t("vr_space_projected"): "projected"}
+        self._vr_dropdown(opt, "vr_mosaic_space", self._vr_mosaic_space_values, "auto")
+
+        # Fisheye FOV (numeric; 0 = auto/detected)
+        fov_row = ctk.CTkFrame(opt, fg_color="transparent")
+        fov_row.pack(fill="x")
+        fov_label = ctk.CTkLabel(fov_row, text=t("vr_fov_deg"), text_color=Colors.TEXT_PRIMARY, font=(Fonts.FAMILY, Fonts.SIZE_NORMAL))
+        fov_label.pack(side="left")
+        fov_tip = ctk.CTkLabel(fov_row, text="ⓘ", text_color=Colors.TEXT_PRIMARY, font=(Fonts.FAMILY, Fonts.SIZE_TINY), cursor="hand2")
+        fov_tip.pack(side="left", padx=4)
+        Tooltip(fov_tip, get_tooltip("vr_fov_deg"))
+        self._widgets["vr_fov_deg"] = ctk.CTkEntry(fov_row, width=80, fg_color=Colors.BG_CARD, text_color=Colors.TEXT_PRIMARY)
+        self._widgets["vr_fov_deg"].pack(side="right")
+        self._widgets["vr_fov_deg"].insert(0, "0")
+        self._widgets["vr_fov_deg"].bind("<KeyRelease>", lambda e: self._mark_modified())
+
+        self._on_vr_mode_changed()
 
     def _browse_working_directory(self):
         dirpath = filedialog.askdirectory(title=t("dialog_select_working_directory"))
@@ -1192,16 +1247,17 @@ class SettingsPanel(ctk.CTkFrame):
         else:
             self._widgets["enable_crossfade"].deselect()
 
-        if getattr(preset, "fisheye_remap", False):
-            self._widgets["fisheye_remap"].select()
-        else:
-            self._widgets["fisheye_remap"].deselect()
+        # VR settings
+        self._widgets["vr_mode"].set(self._vr_display(self._vr_mode_values, getattr(preset, "vr_mode", "auto")))
+        self._widgets["vr_input_projection"].set(self._vr_display(self._vr_input_proj_values, getattr(preset, "vr_input_projection", "auto")))
+        self._widgets["vr_output_projection"].set(self._vr_display(self._vr_output_proj_values, getattr(preset, "vr_output_projection", "source")))
+        self._widgets["vr_layout"].set(self._vr_display(self._vr_layout_values, getattr(preset, "vr_layout", "auto")))
+        self._widgets["vr_eye"].set(self._vr_display(self._vr_eye_values, getattr(preset, "vr_eye", "both")))
+        self._widgets["vr_mosaic_space"].set(self._vr_display(self._vr_mosaic_space_values, getattr(preset, "vr_mosaic_space", "auto")))
+        self._widgets["vr_fov_deg"].delete(0, "end")
+        self._widgets["vr_fov_deg"].insert(0, str(getattr(preset, "vr_fov_deg", 0.0)))
+        self._on_vr_mode_changed()
 
-        if getattr(preset, "reproject_to_source", False):
-            self._widgets["reproject_to_source"].select()
-        else:
-            self._widgets["reproject_to_source"].deselect()
-            
         if preset.fp16_mode:
             self._widgets["fp16_mode"].select()
         else:
@@ -1429,8 +1485,13 @@ class SettingsPanel(ctk.CTkFrame):
             max_clip_size=int(self._widgets["max_clip_size"].get()),
             temporal_overlap=int(self._widgets["temporal_overlap"].get()),
             enable_crossfade=self._widgets["enable_crossfade"].get() == 1,
-            fisheye_remap=self._widgets["fisheye_remap"].get() == 1,
-            reproject_to_source=self._widgets["reproject_to_source"].get() == 1,
+            vr_mode=self._vr_mode_values.get(self._widgets["vr_mode"].get(), "auto"),
+            vr_input_projection=self._vr_input_proj_values.get(self._widgets["vr_input_projection"].get(), "auto"),
+            vr_output_projection=self._vr_output_proj_values.get(self._widgets["vr_output_projection"].get(), "source"),
+            vr_layout=self._vr_layout_values.get(self._widgets["vr_layout"].get(), "auto"),
+            vr_eye=self._vr_eye_values.get(self._widgets["vr_eye"].get(), "both"),
+            vr_mosaic_space=self._vr_mosaic_space_values.get(self._widgets["vr_mosaic_space"].get(), "auto"),
+            vr_fov_deg=self._parse_float(self._widgets["vr_fov_deg"].get(), 0.0),
             fp16_mode=self._widgets["fp16_mode"].get() == 1,
             denoise_strength=denoise_strength,
             denoise_step=denoise_step,

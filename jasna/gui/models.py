@@ -68,8 +68,14 @@ class AppSettings:
     max_clip_size: int = 90
     temporal_overlap: int = 8
     enable_crossfade: bool = True
-    fisheye_remap: bool = False
-    reproject_to_source: bool = False
+    # VR / projection (unified, auto-detected). vr_mode: auto=detect & apply, on=force, off=disable.
+    vr_mode: str = "auto"                  # auto | on | off
+    vr_input_projection: str = "auto"      # auto | equirect | fisheye
+    vr_output_projection: str = "source"   # source | equirect | fisheye
+    vr_layout: str = "auto"                # auto | sbs | tb | mono
+    vr_eye: str = "both"                   # both | left | right
+    vr_mosaic_space: str = "auto"          # auto | fisheye | projected
+    vr_fov_deg: float = 0.0                # 0 = auto/detected; else fisheye lens FOV (e.g. 180/200/220)
     fp16_mode: bool = True
     
     # Denoising

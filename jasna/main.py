@@ -267,29 +267,65 @@ def build_parser() -> argparse.ArgumentParser:
         help="Detection score threshold (default: %(default)s)",
     )
 
-    projection = parser.add_argument_group("Projection")
+    projection = parser.add_argument_group("Projection / VR")
     projection.add_argument(
-        "--fisheye-remap",
-        default=False,
-        action=argparse.BooleanOptionalAction,
-        help=(
-            "Remap half-equirectangular side-by-side (VR180) frames to equidistant "
-            "fisheye SBS on the GPU before detection. Improves detection/restoration on "
-            "VR180 content and produces a fisheye-projected output. (default: %(default)s)"
-        ),
+        "--probe",
+        action="store_true",
+        help="Detect and print each input's VR format (layout / projection / FOV), then exit without processing.",
     )
     projection.add_argument(
-        "--reproject-to-source",
-        default=False,
-        action=argparse.BooleanOptionalAction,
-        help=(
-            "With --fisheye-remap, reproject the restored result back to the source "
-            "half-equirectangular (VR180) projection before encoding, so the output "
-            "matches the original projection. No effect without --fisheye-remap. "
-            "(default: %(default)s)"
-        ),
+        "--vr-mode",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="VR handling: 'auto' detects the format and applies the right processing; "
+             "'on' forces VR processing; 'off' disables it. (default: %(default)s)",
     )
-
+    projection.add_argument(
+        "--vr-input-projection",
+        choices=["auto", "equirect", "fisheye"],
+        default="auto",
+        help="Per-eye input projection. 'auto' detects it. (default: %(default)s)",
+    )
+    projection.add_argument(
+        "--vr-output-projection",
+        choices=["source", "equirect", "fisheye"],
+        default="source",
+        help="Output projection. 'source' keeps the input projection (recommended). (default: %(default)s)",
+    )
+    projection.add_argument(
+        "--vr-layout",
+        choices=["auto", "sbs", "tb", "mono"],
+        default="auto",
+        help="Stereo layout: side-by-side, top-bottom or mono. 'auto' detects it. (default: %(default)s)",
+    )
+    projection.add_argument(
+        "--vr-fov",
+        choices=["auto", "180", "360"],
+        default="auto",
+        help="Horizontal field of view. 'auto' detects it. 360->fisheye remap is not yet supported. (default: %(default)s)",
+    )
+    projection.add_argument(
+        "--vr-eye",
+        choices=["both", "left", "right"],
+        default="both",
+        help="Process both eyes, or restore only one eye and mirror it to the other "
+             "(faster; slight 3D loss on restored regions). (default: %(default)s)",
+    )
+    projection.add_argument(
+        "--vr-mosaic-space",
+        choices=["auto", "fisheye", "projected"],
+        default="auto",
+        help="Space the mosaic was applied in: 'fisheye' (camera) un-warps equirect to "
+             "fisheye before restoring; 'projected' restores directly in the source "
+             "projection. (default: %(default)s)",
+    )
+    projection.add_argument(
+        "--vr-fov-deg",
+        type=float,
+        default=None,
+        help="Fisheye lens FOV in degrees for the remap grid (e.g. 180, 190, 200, 220). "
+             "Defaults to the detected/assumed value.",
+    )
     streaming = parser.add_argument_group("Streaming")
     streaming.add_argument(
         "--stream",
@@ -394,7 +430,7 @@ def main() -> None:
 
     if args.input is None and not is_streaming:
         parser.error("--input is required when not using --benchmark or --stream")
-    if args.output is None and not is_streaming:
+    if args.output is None and not is_streaming and not args.probe:
         parser.error("--output is required when not using --benchmark or --stream")
 
     path_ok, path_info = check_ascii_install_path()
@@ -447,6 +483,22 @@ def main() -> None:
     from jasna.media.image_io import is_image_path
     input_is_image = input_video is not None and is_image_path(input_video)
     input_is_dir = input_video is not None and input_video.is_dir()
+
+    if args.probe:
+        from jasna.media.vr_detect import detect_vr_format
+        if input_is_dir:
+            from jasna.media.media_files import classify_folder
+            _, probe_vids = classify_folder(input_video)
+        elif input_video is not None and not input_is_image:
+            probe_vids = [input_video]
+        else:
+            probe_vids = []
+        for vid in probe_vids:
+            fmt = detect_vr_format(str(vid))
+            print(f"{vid.name}: {fmt.summary()}")
+            if fmt.notes:
+                print(f"    note: {fmt.notes}")
+        return
 
     folder_videos: list[Path] = []
     folder_output_dir: Path | None = None
@@ -630,6 +682,29 @@ def main() -> None:
             raise FileNotFoundError(lut_arg)
         lut_path = lut_arg or None
 
+        from jasna.media.vr_detect import resolve_vr_config, VRConfig
+        _vr_log = logging.getLogger("jasna.main")
+
+        def _resolve_vr(vid_input: Path) -> VRConfig | None:
+            # Streaming uses a placeholder path; skip detection there.
+            if not Path(vid_input).is_file():
+                return None
+            cfg, detected = resolve_vr_config(
+                str(vid_input),
+                mode=args.vr_mode,
+                input_projection=args.vr_input_projection,
+                output_projection=args.vr_output_projection,
+                layout=args.vr_layout,
+                fov=args.vr_fov,
+                eye=args.vr_eye,
+                mosaic_space=args.vr_mosaic_space,
+                fov_deg=args.vr_fov_deg,
+            )
+            if detected is not None:
+                _vr_log.info("VR detect: %s", detected.summary())
+            _vr_log.info("VR config: %s", cfg.describe() if cfg else "disabled")
+            return cfg
+
         def _make_pipeline(vid_input: Path, out_path: Path) -> Pipeline:
             return Pipeline(
                 input_video=vid_input,
@@ -645,8 +720,7 @@ def main() -> None:
                 max_clip_size=max_clip_size,
                 temporal_overlap=temporal_overlap,
                 enable_crossfade=bool(args.enable_crossfade),
-                fisheye_remap=bool(args.fisheye_remap),
-                reproject_to_source=bool(args.reproject_to_source),
+                vr_config=_resolve_vr(vid_input),
                 fp16=fp16,
                 disable_progress=args.no_progress,
                 working_directory=working_directory,
