@@ -8,7 +8,7 @@ import torch
 from av.codec.hwaccel import HWAccel
 from av.video.reformatter import ColorRange as AvColorRange, VideoReformatter
 
-from jasna.media import VideoMetadata, resolve_video_start_pts
+from jasna.media import VideoMetadata, codec_open_lock, resolve_video_start_pts
 from jasna.media.yuv_to_rgb import YuvToRgbConverter
 
 log = logging.getLogger(__name__)
@@ -234,11 +234,13 @@ class NvidiaVideoReader(_VideoReaderBase):
         # FFmpeg to change the active primary context's scheduling flags.
         hwaccel.options["primary_ctx"] = "0"
         hwaccel.options["current_ctx"] = "1"
-        try:
-            self.container = av.open(self.file, hwaccel=hwaccel)
-            self.video_stream = self.container.streams.video[0]
-        except av.FFmpegError as e:
-            raise VideoDecodeError(f"Failed to open {self.file}: {e}") from e
+        # Serialize hardware codec init across pipeline threads (see codec_open_lock).
+        with codec_open_lock:
+            try:
+                self.container = av.open(self.file, hwaccel=hwaccel)
+                self.video_stream = self.container.streams.video[0]
+            except av.FFmpegError as e:
+                raise VideoDecodeError(f"Failed to open {self.file}: {e}") from e
 
         ctx = self.video_stream.codec_context
         if not ctx.is_hwaccel:
@@ -334,13 +336,15 @@ class SoftwareVideoReader(_VideoReaderBase):
     """
 
     def __enter__(self):
-        try:
-            self.container = av.open(self.file)
-            self.video_stream = self.container.streams.video[0]
-        except av.FFmpegError as e:
-            raise VideoDecodeError(f"Failed to open {self.file}: {e}") from e
-        ctx = self.video_stream.codec_context
-        ctx.thread_type = "AUTO"
+        # Serialize codec init across pipeline threads (see codec_open_lock).
+        with codec_open_lock:
+            try:
+                self.container = av.open(self.file)
+                self.video_stream = self.container.streams.video[0]
+            except av.FFmpegError as e:
+                raise VideoDecodeError(f"Failed to open {self.file}: {e}") from e
+            ctx = self.video_stream.codec_context
+            ctx.thread_type = "AUTO"
         self.width = ctx.width
         self.height = ctx.height
         self._full_range = (

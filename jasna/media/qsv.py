@@ -10,9 +10,11 @@ conversion/upload pipeline this class inherits is already exactly that.
 from __future__ import annotations
 
 import logging
+import os
 
 import av
 
+from jasna.media import codec_open_lock
 from jasna.media.video_decoder import SoftwareVideoReader, VideoDecodeError
 from av.video.reformatter import ColorRange as AvColorRange
 
@@ -33,7 +35,14 @@ def qsv_decoder_name(codec_name: str) -> str | None:
     return _QSV_DECODERS.get(str(codec_name).lower())
 
 
+def qsv_disabled() -> bool:
+    """Escape hatch: JASNA_DISABLE_QSV=1 forces software decode and encode."""
+    return os.environ.get("JASNA_DISABLE_QSV", "").lower() in ("1", "true", "yes")
+
+
 def qsv_decoder_available(codec_name: str) -> bool:
+    if qsv_disabled():
+        return False
     name = qsv_decoder_name(codec_name)
     if name is None:
         return False
@@ -53,28 +62,31 @@ class QsvVideoReader(SoftwareVideoReader):
     """GPU (QSV) decode with copy-back host frames, then the shared upload path."""
 
     def __enter__(self):
-        try:
-            self.container = av.open(self.file)
-            self.video_stream = self.container.streams.video[0]
-        except av.FFmpegError as e:
-            raise VideoDecodeError(f"Failed to open {self.file}: {e}") from e
-
         decoder = qsv_decoder_name(self.metadata.codec_name)
         if decoder is None:
             raise VideoDecodeError(
                 f"No QSV decoder for codec {self.metadata.codec_name!r} ({self.file})"
             )
-        stream_ctx = self.video_stream.codec_context
-        try:
-            ctx = av.Codec(decoder, "r").create()
-            # gpu_copy=on = copy-back mode: decoded surfaces are transferred to
-            # system memory by the driver and frames arrive as nv12/p010le.
-            ctx.options = {"gpu_copy": "on"}
-            if stream_ctx.extradata:
-                ctx.extradata = stream_ctx.extradata
-            ctx.open()
-        except av.FFmpegError as e:
-            raise VideoDecodeError(f"Failed to open QSV decoder {decoder} for {self.file}: {e}") from e
+        # Opening a QSV decoder concurrently with another hardware codec open
+        # deadlocks avcodec_open2; serialize it (see codec_open_lock).
+        with codec_open_lock:
+            try:
+                self.container = av.open(self.file)
+                self.video_stream = self.container.streams.video[0]
+            except av.FFmpegError as e:
+                raise VideoDecodeError(f"Failed to open {self.file}: {e}") from e
+
+            stream_ctx = self.video_stream.codec_context
+            try:
+                ctx = av.Codec(decoder, "r").create()
+                # gpu_copy=on = copy-back mode: decoded surfaces are transferred to
+                # system memory by the driver and frames arrive as nv12/p010le.
+                ctx.options = {"gpu_copy": "on"}
+                if stream_ctx.extradata:
+                    ctx.extradata = stream_ctx.extradata
+                ctx.open()
+            except av.FFmpegError as e:
+                raise VideoDecodeError(f"Failed to open QSV decoder {decoder} for {self.file}: {e}") from e
         self._qsv_ctx = ctx
 
         self.width = stream_ctx.width

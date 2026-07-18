@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import threading
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import TYPE_CHECKING
@@ -13,6 +14,16 @@ if TYPE_CHECKING:
     from av.video.reformatter import Colorspace as AvColorspace, ColorRange as AvColorRange
 
 logger = logging.getLogger(__name__)
+
+# avcodec_open2 is not safe to call concurrently for hardware codecs: two
+# threads opening QSV/oneVPL contexts at once deadlock on ffmpeg's codec-init
+# mutex, made worse by PyAV's av_log -> Python logging callback firing inside
+# the open. The pipeline opens a decoder in DecodeDetect and a second one in
+# BlendEncode simultaneously, so every codec-context open in the media layer
+# is serialized through this lock. Opens are one-time per reader/encoder, so
+# there is no steady-state cost. RLock tolerates nested opens within a thread
+# (e.g. an encoder that also opens its source demuxer).
+codec_open_lock = threading.RLock()
 
 # ffmpeg *_nvenc option names shared by every codec
 _COMMON_ENCODER_SETTINGS: frozenset[str] = frozenset(

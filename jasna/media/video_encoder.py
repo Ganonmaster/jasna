@@ -24,6 +24,7 @@ from jasna.media import (
     QSV_ENCODER_SETTINGS_BY_CODEC,
     SOFTWARE_ENCODER_SETTINGS_BY_CODEC,
     VideoMetadata,
+    codec_open_lock,
     validate_encoder_settings,
 )
 from jasna.media.audio_utils import needs_audio_reencode
@@ -272,10 +273,12 @@ def _qsv_encoders_usable() -> bool:
 
 
 def encoder_specs_for_device(device: torch.device) -> dict[str, EncoderSpec]:
+    from jasna.media.qsv import qsv_disabled
+
     media = hw_media(device)
     if media == "nvdec_nvenc":
         return ENCODER_SPECS
-    if media == "qsv" and _qsv_encoders_usable():
+    if media == "qsv" and not qsv_disabled() and _qsv_encoders_usable():
         return ENCODER_SPECS_QSV
     return ENCODER_SPECS_SOFTWARE
 
@@ -424,19 +427,22 @@ class VideoEncoder:
                 f"Encoder {self.encoder_name} (codec {self.codec}) is not available in the "
                 f"bundled FFmpeg libraries: {exc}"
             ) from exc
-        self._src = av.open(self.metadata.video_file)
+        # Serialize codec/demuxer init against the pipeline's reader opens
+        # (see codec_open_lock) — concurrent hardware avcodec_open2 deadlocks.
+        with codec_open_lock:
+            self._src = av.open(self.metadata.video_file)
 
-        container_options = {}
-        if self.output_path.suffix.lower() in {".mp4", ".mov"}:
-            container_options["movflags"] = "+faststart"
-        self.dst = av.open(str(self.output_path), "w", container_options=container_options)
-        self.dst.metadata.update(self._src.metadata)
+            container_options = {}
+            if self.output_path.suffix.lower() in {".mp4", ".mov"}:
+                container_options["movflags"] = "+faststart"
+            self.dst = av.open(str(self.output_path), "w", container_options=container_options)
+            self.dst.metadata.update(self._src.metadata)
 
-        out_v = self.dst.add_stream(
-            self.encoder_name,
-            rate=self.output_fps,
-            options=dict(self.encoder_options),
-        )
+            out_v = self.dst.add_stream(
+                self.encoder_name,
+                rate=self.output_fps,
+                options=dict(self.encoder_options),
+            )
         out_v.width = self.metadata.video_width
         out_v.height = self.metadata.video_height
         out_v.time_base = self.metadata.time_base
