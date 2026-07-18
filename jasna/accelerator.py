@@ -3,10 +3,20 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import lru_cache
+import importlib.util
+import logging
 import os
+import subprocess
+import sys
 from typing import Any
 
 import torch
+
+logger = logging.getLogger(__name__)
+
+# Override for the BasicVSR++ deformable-conv implementation (A/B testing).
+DEFORM_BACKEND_ENV = "JASNA_DEFORM_BACKEND"
 
 # NORMAL benchmarks every unseen convolution problem. BasicVSR++ has fixed
 # spatial dimensions but a variable temporal clip length (and therefore variable
@@ -80,6 +90,14 @@ def is_nvidia_device(device: torch.device | str | None = None) -> bool:
 
 def is_amd_device(device: torch.device | str | None = None) -> bool:
     return vendor_for_device(device) is AcceleratorVendor.AMD
+
+
+def is_intel_device(device: torch.device | str | None = None) -> bool:
+    return vendor_for_device(device) is AcceleratorVendor.INTEL
+
+
+def is_gpu(device: torch.device | str) -> bool:
+    return torch.device(device).type != "cpu"
 
 
 def device_module(device: torch.device | str):
@@ -164,3 +182,119 @@ def device_name(device: torch.device | str) -> str:
     if resolved.type == "cpu":
         return "CPU"
     return str(device_module(resolved).get_device_name(resolved))
+
+
+def autocast(device: torch.device | str, dtype: torch.dtype | None = None, enabled: bool = True):
+    """Vendor-neutral autocast. fp16 on cuda (incl. ROCm), bf16 on xpu (fp16 is
+    unreliable on Arc); nullcontext on cpu or when disabled."""
+    resolved = torch.device(device)
+    if not enabled or resolved.type == "cpu":
+        return nullcontext()
+    if dtype is None:
+        dtype = torch.float16 if resolved.type == "cuda" else torch.bfloat16
+    return torch.autocast(resolved.type, dtype=dtype)
+
+
+def host_buffer(shape: tuple[int, ...], dtype: torch.dtype, want_pinned: bool) -> torch.Tensor:
+    """Host tensor for GPU staging; falls back to pageable memory when pinning fails."""
+    if want_pinned:
+        try:
+            return torch.empty(shape, dtype=dtype, pin_memory=True)
+        except RuntimeError as e:
+            logger.warning("Pinned host memory unavailable (%s); using pageable buffers", e)
+    return torch.empty(shape, dtype=dtype)
+
+
+def deform_conv2d_backend(device: torch.device | str) -> str:
+    """"torchvision" (native kernel) or "grid_sample" (pure-torch composition).
+
+    torchvision ships no XPU deform_conv2d kernel (pytorch/vision RFC #8679); its
+    dispatcher silently falls back to the fp32 CPU kernel, dragging the alignment
+    features through host memory every clip. The grid_sample composition runs
+    natively on xpu. cuda/cpu keep the torchvision kernel (bit-identical). AMD
+    (device.type=="cuda") also keeps torchvision — torchvision-ROCm has the kernel.
+    JASNA_DEFORM_BACKEND overrides for A/B testing.
+    """
+    override = os.environ.get(DEFORM_BACKEND_ENV)
+    if override in ("torchvision", "grid_sample"):
+        return override
+    if torch.device(device).type == "xpu":
+        return "grid_sample"
+    return "torchvision"
+
+
+def _module_available(name: str) -> bool:
+    """Package presence without importing it (importing tensorrt/nvvfx has
+    DLL-ordering side effects). Already-loaded / test-injected modules count."""
+    if name in sys.modules:
+        return True
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def supports_tensorrt(device: torch.device | str | None = None) -> bool:
+    return is_nvidia_device(device) and _module_available("tensorrt")
+
+
+def supports_nvvfx(device: torch.device | str | None = None) -> bool:
+    return is_nvidia_device(device) and _module_available("nvvfx")
+
+
+_XPU_PROBE_CODE = (
+    "import torch, sys; "
+    "ok = getattr(torch, 'xpu', None) is not None and torch.xpu.is_available(); "
+    "print(torch.xpu.get_device_name(0) if ok else ''); "
+    "sys.exit(0 if ok else 1)"
+)
+
+
+@lru_cache(maxsize=1)
+def probe_xpu_subprocess() -> tuple[bool, str]:
+    """Probe torch.xpu availability in a subprocess → (ok, name_or_reason).
+
+    A subprocess is not paranoia: on broken driver stacks torch.xpu.is_available()
+    can hard-crash the process (Lada #292), and on Battlemage the default
+    Level-Zero backend can SIGABRT (intel/compute-runtime#922). On failure, retry
+    via the OpenCL adapter; if that works, export ONEAPI_DEVICE_SELECTOR for this
+    process so all later xpu use inherits the working backend.
+    """
+    from jasna._frozen import is_frozen
+
+    if is_frozen():
+        # Frozen builds cannot re-invoke a Python interpreter (sys.executable is
+        # the app binary); fall back to a guarded in-process check.
+        try:
+            ok = getattr(torch, "xpu", None) is not None and torch.xpu.is_available()
+        except Exception as exc:  # pragma: no cover - defensive
+            return False, f"torch.xpu check failed: {exc}"
+        return (True, torch.xpu.get_device_name(0)) if ok else (False, "torch.xpu unavailable")
+
+    def _run(extra_env: dict[str, str]) -> tuple[bool, str]:
+        env = {**os.environ, **extra_env}
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", _XPU_PROBE_CODE],
+                capture_output=True, text=True, timeout=120, env=env,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return False, f"xpu probe failed to run: {exc}"
+        if result.returncode == 0:
+            return True, result.stdout.strip()
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        return False, detail[-1] if detail else f"exit code {result.returncode}"
+
+    ok, info = _run({})
+    if ok:
+        return True, info
+    logger.info("torch.xpu probe failed via default backend (%s); retrying via OpenCL", info)
+    ok_ocl, info_ocl = _run({"ONEAPI_DEVICE_SELECTOR": "opencl:gpu"})
+    if ok_ocl:
+        os.environ["ONEAPI_DEVICE_SELECTOR"] = "opencl:gpu"
+        logger.warning(
+            "torch.xpu works only via the OpenCL backend on this driver stack "
+            "(see intel/compute-runtime#922); exported ONEAPI_DEVICE_SELECTOR=opencl:gpu"
+        )
+        return True, info_ocl
+    return False, info
