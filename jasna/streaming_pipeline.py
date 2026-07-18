@@ -10,6 +10,7 @@ import torch
 
 from jasna.blend_buffer import BlendBuffer
 from jasna.crop_buffer import CropBuffer
+from jasna.device_backend import gpu_mod
 from jasna.frame_queue import FrameQueue
 from jasna.media import UnsupportedColorspaceError, get_video_meta_data
 from jasna.pipeline_items import FrameMeta, _SENTINEL
@@ -113,9 +114,10 @@ def run_streaming(
         if own_server:
             hls_server.stop()
         gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-        torch.cuda.reset_peak_memory_stats(device)
+        gpu = gpu_mod(device)
+        gpu.empty_cache()
+        gpu.ipc_collect()
+        gpu.reset_peak_memory_stats(device)
 
 
 def _streaming_loop(

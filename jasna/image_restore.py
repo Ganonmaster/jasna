@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,6 +8,8 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+from jasna.device_backend import device_ctx, resolve_fp16
 
 logger = logging.getLogger(__name__)
 
@@ -274,7 +275,7 @@ def _run_image_jobs(args, jobs: list[tuple[Path, Path]], progress_callback=None)
         return
 
     device = torch.device(str(args.device))
-    fp16 = bool(args.fp16)
+    fp16 = resolve_fp16(args.fp16, device)
     batch_size = int(args.batch_size)
     score_threshold = float(args.detection_score_threshold)
 
@@ -322,7 +323,7 @@ def _run_image_jobs(args, jobs: list[tuple[Path, Path]], progress_callback=None)
             if progress_callback is not None:
                 progress_callback(i, input_path, output_base)
             img = image_io.read_image_rgb_chw(input_path)
-            with torch.cuda.device(device) if device.type == "cuda" else nullcontext():
+            with device_ctx(device):
                 outputs = restore_image(
                     img, detector, restorer,
                     device=device, fp16=fp16,

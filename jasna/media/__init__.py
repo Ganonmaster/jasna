@@ -44,10 +44,39 @@ _COMMON_ENCODER_SETTINGS: frozenset[str] = frozenset(
 )
 
 # hevc_nvenc/h264_nvenc accept both AQ spellings; av1_nvenc only the hyphen one.
-SUPPORTED_ENCODER_SETTINGS_BY_CODEC: dict[str, frozenset[str]] = {
+NVENC_ENCODER_SETTINGS_BY_CODEC: dict[str, frozenset[str]] = {
     "hevc": _COMMON_ENCODER_SETTINGS | {"profile", "tier", "spatial_aq", "spatial-aq"},
     "h264": _COMMON_ENCODER_SETTINGS | {"profile", "coder", "spatial_aq", "spatial-aq"},
     "av1": _COMMON_ENCODER_SETTINGS | {"tier", "spatial-aq", "tile-rows", "tile-columns"},
+}
+
+# Intel QSV (*_qsv) option names.
+_QSV_COMMON_ENCODER_SETTINGS: frozenset[str] = frozenset(
+    {"preset", "profile", "g", "bf", "maxrate", "bufsize", "global_quality", "async_depth", "low_power"}
+)
+QSV_ENCODER_SETTINGS_BY_CODEC: dict[str, frozenset[str]] = {
+    "hevc": _QSV_COMMON_ENCODER_SETTINGS | {"tier"},
+    "h264": _QSV_COMMON_ENCODER_SETTINGS | {"look_ahead"},
+    "av1": _QSV_COMMON_ENCODER_SETTINGS | {"tile_rows", "tile_cols"},
+}
+
+# Software encoder (libx264/libx265/libsvtav1) option names.
+SOFTWARE_ENCODER_SETTINGS_BY_CODEC: dict[str, frozenset[str]] = {
+    "hevc": frozenset({"preset", "tune", "profile", "crf", "qmin", "qmax", "g", "bf", "maxrate", "bufsize"}),
+    "h264": frozenset({"preset", "tune", "profile", "crf", "qmin", "qmax", "g", "bf", "maxrate", "bufsize"}),
+    "av1": frozenset({"preset", "crf", "g", "maxrate", "bufsize"}),
+}
+
+# CLI-time validation is device-agnostic (the backend is only known once the
+# encoder is constructed), so the by-codec map is the union across backends;
+# the encoder re-validates strictly against its own spec.supported_settings.
+SUPPORTED_ENCODER_SETTINGS_BY_CODEC: dict[str, frozenset[str]] = {
+    codec: (
+        NVENC_ENCODER_SETTINGS_BY_CODEC[codec]
+        | QSV_ENCODER_SETTINGS_BY_CODEC[codec]
+        | SOFTWARE_ENCODER_SETTINGS_BY_CODEC[codec]
+    )
+    for codec in NVENC_ENCODER_SETTINGS_BY_CODEC
 }
 
 SUPPORTED_ENCODER_SETTINGS: frozenset[str] = frozenset().union(
@@ -99,12 +128,20 @@ def parse_encoder_settings(value: str) -> dict[str, object]:
     return settings
 
 
-def validate_encoder_settings(settings: dict[str, object], codec: str | None = None) -> dict[str, object]:
+def validate_encoder_settings(
+    settings: dict[str, object],
+    codec: str | None = None,
+    *,
+    supported: frozenset[str] | None = None,
+    scope_name: str | None = None,
+) -> dict[str, object]:
     if "spatial_aq" in settings and "spatial-aq" in settings:
         raise ValueError(
             "Conflicting encoder settings: spatial_aq and spatial-aq are aliases; use only one"
         )
-    if codec is None:
+    if supported is not None:
+        scope = f"Supported for {scope_name or codec or 'this encoder'}"
+    elif codec is None:
         supported = SUPPORTED_ENCODER_SETTINGS
         scope = "Supported"
     else:

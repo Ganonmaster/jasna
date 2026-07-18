@@ -47,6 +47,15 @@ def get_onnx_tensorrt_engine_path(
     return onnx_path.with_suffix(suffix)
 
 
+def ov_cache_dir() -> Path:
+    """OpenVINO compiled-blob cache directory (the TRT engine-cache analog).
+
+    OpenVINO keys blobs by model + compile config hash itself, so one shared
+    directory replaces the per-file .engine naming scheme used for TensorRT.
+    """
+    return model_weights_dir() / "ov_cache"
+
+
 def get_yolo_tensorrt_engine_path(model_path: str | Path, *, fp16: bool) -> Path:
     model_path = Path(model_path)
     if model_path.suffix.lower() != ".pt":

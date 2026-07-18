@@ -10,8 +10,9 @@ import torch
 
 from jasna.blend_buffer import BlendBuffer
 from jasna.crop_buffer import CropBuffer
+from jasna.device_backend import gpu_mod
 from jasna.frame_queue import FrameQueue
-from jasna.media.video_decoder import NvidiaVideoReader
+from jasna.media.video_decoder import create_video_reader
 from jasna.pipeline_debug_logging import PipelineDebugMemoryLogger
 from jasna.pipeline_items import ClipRestoreItem, FrameMeta, PrimaryRestoreResult, SecondaryRestoreResult, _SENTINEL
 from jasna.pipeline_processing import process_frame_batch, finalize_processing
@@ -59,13 +60,13 @@ def decode_detect_loop(
 ) -> None:
     timer = LoopTimer("decode-detect")
     try:
-        torch.cuda.set_device(device)
+        gpu_mod(device).set_device(device)
         tracker = ClipTracker(max_clip_size=max_clip_size, temporal_overlap=temporal_overlap)
         discard_margin = temporal_overlap
         blend_frames = (temporal_overlap // 3) if enable_crossfade else 0
 
         with (
-            NvidiaVideoReader(
+            create_video_reader(
                 input_video,
                 batch_size=batch_size,
                 device=device,
@@ -232,7 +233,7 @@ def primary_restore_loop(
 ) -> None:
     timer = LoopTimer("primary")
     try:
-        torch.cuda.set_device(device)
+        gpu_mod(device).set_device(device)
         log.debug("[primary] thread starting")
         while True:
             if cancel_event is not None and cancel_event.is_set():
@@ -291,7 +292,7 @@ def secondary_restore_loop(
 ) -> None:
     timer = LoopTimer("secondary")
     try:
-        torch.cuda.set_device(device)
+        gpu_mod(device).set_device(device)
         log.debug("[secondary] thread starting")
         while True:
             if cancel_event is not None and cancel_event.is_set():
@@ -352,14 +353,14 @@ def blend_encode_loop(
 ) -> None:
     timer = LoopTimer("blend-encode")
     try:
-        torch.cuda.set_device(device)
+        gpu_mod(device).set_device(device)
 
-        def _flat_frames(rdr: NvidiaVideoReader):
+        def _flat_frames(rdr):
             for batch, pts in rdr.frames(seek_ts=seek_ts):
                 for i in range(len(pts)):
                     yield batch[i]
 
-        with NvidiaVideoReader(
+        with create_video_reader(
             input_video,
             batch_size=batch_size,
             device=device,

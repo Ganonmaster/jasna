@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 
 from jasna.media import VideoMetadata
-from jasna.os_utils import find_executable, get_subprocess_startup_info
+from jasna.os_utils import find_executable, get_subprocess_startup_info, subprocess_no_window_kwargs
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +41,9 @@ class StreamingEncoder:
         if device is not None and device.type == 'cuda':
             gpu_idx = device.index if device.index is not None else 0
         self._gpu_index = gpu_idx
+        # device=None historically meant "NVENC on GPU 0"; keep that contract
+        # for legacy callers — the pipeline always passes a real device.
+        self._device_type = device.type if device is not None else 'cuda'
 
         self._ffmpeg = find_executable('ffmpeg')
         if self._ffmpeg is None:
@@ -96,6 +99,70 @@ class StreamingEncoder:
         self._close_ffmpeg()
         log.debug("[stream-enc] stopped")
 
+    def _ffmpeg_has_encoder(self, name: str) -> bool:
+        """Whether the external ffmpeg binary (not PyAV's) ships an encoder."""
+        try:
+            result = subprocess.run(
+                [self._ffmpeg, '-hide_banner', '-encoders'],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                **subprocess_no_window_kwargs(),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return name in result.stdout
+
+    def _video_codec_args(self) -> list[str]:
+        """Low-latency H.264 encode args for the compute device's backend.
+
+        The nvenc block is the original tuned configuration; qsv/libx264 are
+        first-cut equivalents (no B-frames, segment-aligned GOP). The QSV
+        branch verifies the external ffmpeg actually ships h264_qsv — batch
+        export probes PyAV's bundled FFmpeg, which is a different binary.
+        """
+        if self._device_type == 'xpu' and not self._ffmpeg_has_encoder('h264_qsv'):
+            log.warning(
+                "System ffmpeg has no h264_qsv encoder; streaming will use libx264 (CPU)."
+            )
+            self._device_type = 'cpu'
+        if self._device_type == 'cuda':
+            return [
+                '-c:v', 'h264_nvenc',
+                '-preset', 'p4',
+                '-tune', 'll',
+                '-rc', 'vbr',
+                '-cq', '19',
+                '-bf', '0',
+                '-profile:v', 'high',
+                '-spatial-aq', '1',
+                '-temporal-aq', '1',
+                '-rc-lookahead', '8',
+                '-gpu', str(self._gpu_index),
+                '-g', str(self._gop_size),
+                '-pix_fmt', 'yuv420p',
+            ]
+        if self._device_type == 'xpu':
+            return [
+                '-c:v', 'h264_qsv',
+                '-preset', 'medium',
+                '-global_quality', '21',
+                '-bf', '0',
+                '-profile:v', 'high',
+                '-g', str(self._gop_size),
+                '-pix_fmt', 'nv12',
+            ]
+        return [
+            '-c:v', 'libx264',
+            '-preset', 'veryfast',
+            '-tune', 'zerolatency',
+            '-crf', '21',
+            '-bf', '0',
+            '-profile:v', 'high',
+            '-g', str(self._gop_size),
+            '-pix_fmt', 'yuv420p',
+        ]
+
     def _launch_ffmpeg(self, start_number: int) -> None:
         seek_time = start_number * self.segment_duration
         fps_str = f"{self._fps.numerator}/{self._fps.denominator}" if hasattr(self._fps, 'numerator') else str(float(self._fps))
@@ -121,21 +188,7 @@ class StreamingEncoder:
         else:
             cmd += ['-map', '0:v:0']
 
-        cmd += [
-            '-c:v', 'h264_nvenc',
-            '-preset', 'p4',
-            '-tune', 'll',
-            '-rc', 'vbr',
-            '-cq', '19',
-            '-bf', '0',
-            '-profile:v', 'high',
-            '-spatial-aq', '1',
-            '-temporal-aq', '1',
-            '-rc-lookahead', '8',
-            '-gpu', str(self._gpu_index),
-            '-g', str(self._gop_size),
-            '-pix_fmt', 'yuv420p',
-        ]
+        cmd += self._video_codec_args()
 
         sar = self.metadata.sample_aspect_ratio
         if sar != 1:

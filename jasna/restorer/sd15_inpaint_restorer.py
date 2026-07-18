@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -15,6 +14,7 @@ from diffusers import (
 )
 
 from jasna._frozen import is_frozen
+from jasna.device_backend import autocast_ctx
 from jasna.engine_paths import SD15_CKPT_ENC_PATH, SD15_CKPT_PATH
 
 logger = logging.getLogger(__name__)
@@ -135,8 +135,8 @@ class Sd15InpaintRestorer:
         noise = torch.randn_like(init_latents)
         latents = self.scheduler.add_noise(init_latents, noise, t_start.unsqueeze(0))
 
-        ctx = torch.autocast("cuda", dtype=torch.float16) if (self.fp16 and self.device.type == "cuda") else nullcontext()
-        with ctx:
+        # fp16 autocast on cuda; bf16 on xpu (fp16 is unreliable on Arc GPUs).
+        with autocast_ctx(self.device, enabled=self.fp16):
             for t in self.scheduler.timesteps[start_step:]:
                 unet_input = torch.cat([latents, mask_latents, mosaic_latents], dim=1)
                 noise_pred = self.unet(unet_input, t.expand(latents.shape[0]), encoder_hidden_states).sample

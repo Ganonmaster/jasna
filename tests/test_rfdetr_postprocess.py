@@ -151,6 +151,8 @@ def _build_rfdetr_model():
     with (
         patch("jasna.mosaic.rfdetr.get_onnx_tensorrt_engine_path", return_value=engine_path),
         patch("jasna.mosaic.rfdetr.TrtRunner", return_value=mock_runner),
+        # cpu devices route to the OpenVINO runner since the Intel port
+        patch("jasna.mosaic.rfdetr.OvRunner", return_value=mock_runner),
     ):
         model = RfDetrMosaicDetectionModel(
             onnx_path=Path("model.onnx"),

@@ -419,10 +419,14 @@ compatible Python/Tk runtime.
 
 The public source checkout does not include the protection module. Running from source is fine for development and free models, but supporter-only models such as **unet-4x** and **SD 1.5 image restoration** will not be available from a plain source checkout.
 
-Install runtime dependencies:
+Install runtime dependencies for your GPU vendor (exactly one of the two extras):
 
 ```bash
-uv pip install . --no-build-isolation
+# Nvidia (CUDA):
+uv pip install ".[nvidia]" --no-build-isolation --extra-index-url https://download.pytorch.org/whl/cu130
+
+# Intel Arc (xpu, Linux server; see docs/intel_arc_server.md):
+uv pip install ".[intel]" --no-build-isolation --extra-index-url https://download.pytorch.org/whl/xpu
 ```
 
 For Nvidia library builds, you also need:
@@ -442,8 +446,8 @@ Developer setup also requires:
   This contains the merged CUDA-current-context API used by Jasna; switch back to the PyPI
   wheel once 18.1.0 is released.
 
-Then install Jasna in editable mode:
+Then install Jasna in editable mode (add the matching GPU extra):
 
 ```bash
-uv pip install -e .[dev]
+uv pip install -e ".[dev,nvidia]" --extra-index-url https://download.pytorch.org/whl/cu130
 ```

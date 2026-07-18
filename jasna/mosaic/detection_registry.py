@@ -155,6 +155,14 @@ def precompile_detection_engine(
     device: torch.device,
     fp16: bool,
 ) -> None:
+    if device.type == "xpu":
+        det_name = coerce_detection_model_name(detection_model_name)
+        if is_rfdetr_model(det_name):
+            from jasna.mosaic.rfdetr import warmup_rfdetr_openvino
+
+            warmup_rfdetr_openvino(detection_model_path, batch_size=int(batch_size))
+        # YOLO runs eagerly through ultralytics on xpu; nothing to precompile.
+        return
     if device.type != "cuda":
         return
     det_name = coerce_detection_model_name(detection_model_name)

@@ -17,11 +17,9 @@ from jasna.engine_paths import (
     get_basicvsrpp_sub_engine_paths as get_sub_engine_paths,
     all_basicvsrpp_sub_engines_exist as all_sub_engines_exist,
 )
-from jasna.trt.torch_tensorrt_export import (
-    compile_and_save_torchtrt_dynamo,
-    get_workspace_size_bytes,
-    load_torchtrt_export,
-)
+# jasna.trt imports tensorrt at package level; import lazily so this module
+# (reached via the restorer package on every install) stays importable on
+# Intel/CPU environments that ship no TensorRT.
 
 logger = logging.getLogger(__name__)
 
@@ -239,6 +237,11 @@ def compile_basicvsrpp_sub_engines(
 ) -> dict[str, str]:
     import torch_tensorrt  # type: ignore[import-not-found]
 
+    from jasna.trt.torch_tensorrt_export import (
+        compile_and_save_torchtrt_dynamo,
+        get_workspace_size_bytes,
+    )
+
     dtype = torch.float16 if fp16 else torch.float32
     engine_dir = _sub_engine_dir(model_weights_path)
     os.makedirs(engine_dir, exist_ok=True)
@@ -357,6 +360,8 @@ def load_sub_engines(
     paths = get_sub_engine_paths(model_weights_path, fp16, max_clip_size)
     if not all(os.path.isfile(p) for p in paths.values()):
         return None
+
+    from jasna.trt.torch_tensorrt_export import load_torchtrt_export
 
     loop_body_engines: dict[str, nn.Module] = {}
     for d in DIRECTIONS:

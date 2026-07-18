@@ -102,6 +102,11 @@ def basicvsrpp_startup_policy(
     if not bool(compile_basicvsrpp):
         return False
 
+    # TRT sub-engines are CUDA-only; stale engines on disk (weights dir shared
+    # with an Nvidia box) must not enable them on other devices.
+    if device.type != "cuda":
+        return False
+
     if all_sub_engines_exist(restoration_model_path, fp16, max_clip_size):
         return True
 

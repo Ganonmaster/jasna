@@ -8,9 +8,16 @@ import torch
 import torch.nn.functional as F
 from ultralytics.utils import nms, ops
 
+from jasna.device_backend import default_fp16
 from jasna.mosaic.detections import Detections
 from jasna.mosaic.yolo_tensorrt_compilation import get_yolo_tensorrt_engine_path
-from jasna.trt.trt_runner import TrtRunner
+
+# TensorRT ships only in Nvidia installs; the eager ultralytics path below is
+# the runtime on other devices. Kept as a module attribute for test patching.
+try:
+    from jasna.trt.trt_runner import TrtRunner
+except ImportError:
+    TrtRunner = None
 
 logger = logging.getLogger(__name__)
 
@@ -131,13 +138,13 @@ class YoloMosaicDetectionModel:
         if self.max_det <= 0:
             raise ValueError(f"max_det must be > 0, got {max_det}")
 
-        self.fp16 = bool(fp16) and (self.device.type == "cuda")
+        self.fp16 = bool(fp16) and default_fp16(self.device)
         self.imgsz = int(imgsz)
         if self.imgsz <= 0:
             raise ValueError(f"imgsz must be > 0, got {imgsz}")
         self.stride = 32
         self.end2end = False
-        self.runner: TrtRunner | None = None
+        self.runner = None
         self.input_dtype = torch.float16 if self.fp16 else torch.float32
 
         runtime_path = self.model_path
@@ -150,6 +157,8 @@ class YoloMosaicDetectionModel:
                 )
 
         if runtime_path.suffix.lower() == ".engine":
+            if TrtRunner is None:
+                raise RuntimeError("TensorRT is not installed; .engine models require an Nvidia install")
             self.runner = TrtRunner(
                 runtime_path,
                 input_shapes=[(self.batch_size, 3, self.imgsz, self.imgsz)],

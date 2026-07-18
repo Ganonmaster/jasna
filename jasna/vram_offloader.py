@@ -10,6 +10,7 @@ import torch
 
 from jasna.blend_buffer import BlendBuffer
 from jasna.crop_buffer import CropBuffer
+from jasna.device_backend import GPU_DEVICE_TYPES, gpu_mod
 
 _log = logging.getLogger(__name__)
 
@@ -76,9 +77,12 @@ class VramOffloader:
         if vram_limit is not None:
             gpu_total = int(vram_limit * 1024 * 1024 * 1024)
         else:
-            gpu_total = torch.cuda.get_device_properties(device).total_memory
+            gpu_total = gpu_mod(device).get_device_properties(device).total_memory
         self._threshold = max(0, gpu_total - safetynet)
-        self._offload_device_type = "cuda"
+        # Only GPU-resident tensors can be spilled to host RAM; on a cpu
+        # pipeline nothing matches (None equals no tensor.device.type).
+        dev_type = torch.device(device).type
+        self._offload_device_type = dev_type if dev_type in GPU_DEVICE_TYPES else None
 
         self.stats = VramStats()
         self._stop = threading.Event()
@@ -122,14 +126,15 @@ class VramOffloader:
         _log.info(self.stats.summary())
 
     def _run(self) -> None:
+        gpu = gpu_mod(self._device)
         while not self._stop.wait(_POLL_INTERVAL):
-            free, total = torch.cuda.mem_get_info(self._device)
+            free, total = gpu.mem_get_info(self._device)
             used = total - free
             self.stats.update(used)
             if used > self._threshold:
                 freed = self._offload(used - self._threshold)
                 if freed > 0:
-                    torch.cuda.empty_cache()
+                    gpu.empty_cache()
                     self.stats.offload_count += 1
                     self.stats.total_offloaded_bytes += freed
                     _log.debug(
@@ -218,9 +223,10 @@ class VramOffloader:
 
         # VRAM
         try:
-            free, total = torch.cuda.mem_get_info(self._device)
-            alloc = torch.cuda.memory_allocated(self._device)
-            reserved = torch.cuda.memory_reserved(self._device)
+            gpu = gpu_mod(self._device)
+            free, total = gpu.mem_get_info(self._device)
+            alloc = gpu.memory_allocated(self._device)
+            reserved = gpu.memory_reserved(self._device)
             lines.append(
                 f"  VRAM: used={((total - free) / _MIB):.0f} MiB"
                 f" allocated={alloc / _MIB:.0f} MiB"

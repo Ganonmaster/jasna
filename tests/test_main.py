@@ -52,6 +52,9 @@ def _main_patches(pipeline_side_effect=None):
         patch("jasna.main.check_nvidia_gpu", return_value=(True, "Fake GPU")),
         patch("jasna.main.check_gpu_driver_version", return_value=(True, "610.18")),
         patch("jasna.main.check_required_executables"),        patch("jasna.main.check_windows_nvidia_sysmem_fallback_policy", return_value=(True, "OK")),
+        # --device defaults to "auto"; pin resolution so tests exercise the
+        # cuda preflight branch on any host and never hit the real xpu probe.
+        patch("jasna.device_backend.resolve_auto_spec", return_value="cuda:0"),
         patch("jasna.engine_compiler.ensure_engines_compiled", return_value=MagicMock(use_basicvsrpp_tensorrt=False)),
         patch("jasna.pipeline.Pipeline", mock_pipeline_cls),
         patch("jasna.restorer.basicvsrpp_mosaic_restorer.BasicvsrppMosaicRestorer", MagicMock()),
@@ -75,8 +78,8 @@ class TestBuildParser:
     def test_defaults(self):
         args = build_parser().parse_args(["--input", "a.mp4", "--output", "b.mp4"])
         assert args.batch_size == 4
-        assert args.device == "cuda:0"
-        assert args.fp16 is True
+        assert args.device == "auto"
+        assert args.fp16 is None  # resolved per device: on for cuda, off for xpu/cpu
         assert args.log_level == "error"
         assert args.max_clip_size == 90
         assert args.temporal_overlap == 8

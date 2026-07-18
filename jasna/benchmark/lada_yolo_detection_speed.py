@@ -6,8 +6,9 @@ from pathlib import Path
 import torch
 
 from jasna.benchmark.harness import run_repeatedly
+from jasna.device_backend import gpu_mod
 from jasna.media import get_video_meta_data
-from jasna.media.video_decoder import NvidiaVideoReader
+from jasna.media.video_decoder import create_video_reader
 from jasna.mosaic.detection_registry import detection_model_weights_path
 from jasna.mosaic.yolo import YoloMosaicDetectionModel
 from jasna.tensor_utils import pad_batch_with_last
@@ -45,7 +46,7 @@ def _run_single(
     total_detections = 0
 
     with (
-        NvidiaVideoReader(
+        create_video_reader(
             str(path),
             batch_size=batch_size,
             device=device,
@@ -67,7 +68,7 @@ def _run_single(
             for i in range(effective_bs):
                 total_detections += len(detections.boxes_xyxy[i])
 
-        torch.cuda.synchronize()
+        gpu_mod(device).synchronize()
         duration = time.perf_counter() - start
 
     return duration, {
@@ -101,6 +102,7 @@ def benchmark_lada_yolo_detection_speed(
                 score_threshold=detection_score_threshold,
             ),
             runs=3,
+            device=device,
         )
         fps = result["frames"] / median_duration if median_duration > 0 else 0.0
         results[path.name] = (median_duration, fps)

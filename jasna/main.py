@@ -4,12 +4,14 @@ import sys
 from pathlib import Path
 
 from jasna import __version__
+from jasna.device_backend import device_ctx, resolve_fp16, supports_nvvfx, supports_tensorrt
 from jasna.engine_paths import model_weights_dir
 from jasna.media import UnsupportedColorspaceError
 from jasna.os_utils import (
     MIN_DRIVER_VERSION,
     check_ascii_install_path,
     check_gpu_driver_version,
+    check_intel_gpu,
     check_nvidia_gpu,
     check_required_executables,
     check_windows_nvidia_sysmem_fallback_policy,
@@ -45,12 +47,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Compute device: auto, cuda[:N], xpu[:N] or cpu (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="List usable compute devices and exit",
+    )
     parser.add_argument(
         "--fp16",
-        default=True,
+        default=None,
         action=argparse.BooleanOptionalAction,
-        help="Use FP16 where supported (restoration + TensorRT). Reduces VRAM usage and might improve performance.",
+        help=(
+            "Use FP16 where supported (restoration + TensorRT). Reduces VRAM usage and might "
+            "improve performance. Default: on for cuda, off for xpu/cpu."
+        ),
     )
     parser.add_argument(
         "--log-level",
@@ -383,6 +398,13 @@ def main() -> None:
         for value in sys.argv[1:]
     )
 
+    if args.list_devices:
+        from jasna.device_backend import list_devices
+
+        for spec, name in list_devices():
+            print(f"{spec}  {name}")
+        return
+
     if args.benchmark:
         from jasna.benchmark import run_benchmark_cli
         run_benchmark_cli(args)
@@ -414,25 +436,55 @@ def main() -> None:
 
     check_required_executables()
 
-    gpu_ok, gpu_result = check_nvidia_gpu()
-    if not gpu_ok:
-        if gpu_result == "no_cuda":
-            print("Error: No CUDA device. An NVIDIA GPU with compute capability 7.5+ is required.")
-        else:
-            _, major, minor = gpu_result
-            print(f"Error: Compute capability 7.5+ required (GPU: {major}.{minor}).")
-        sys.exit(1)
+    from jasna.device_backend import is_valid_device_string, resolve_auto_spec
 
-    driver_ok, driver_info = check_gpu_driver_version()
-    if not driver_ok:
-        print(f"Error: GPU driver version check failed: {driver_info}")
-        print(f"Please update your NVIDIA driver to version {MIN_DRIVER_VERSION} or newer.")
+    device_spec = str(args.device)
+    if not is_valid_device_string(device_spec):
+        print(f"Error: invalid --device {device_spec!r} (expected auto, cpu, cuda[:N] or xpu[:N]).")
         sys.exit(1)
+    if device_spec == "auto":
+        device_spec = resolve_auto_spec()
+        if device_spec == "cpu":
+            # Keep the old fail-fast contract: a GPU user with a broken driver
+            # should get an error, not a silent multi-hour CPU run.
+            print("Error: no usable GPU found (checked cuda and xpu).")
+            print("Fix the GPU driver stack, or pass --device cpu explicitly to run on the CPU (very slow).")
+            sys.exit(1)
+    args.device = device_spec
+    device_type = device_spec.split(":")[0]
 
-    if sys.platform == "win32":
-        sysmem_ok, sysmem_info = check_windows_nvidia_sysmem_fallback_policy()
-        if not sysmem_ok:
-            print(f"Warning: CUDA Sysmem Fallback Policy: {sysmem_info}")
+    if device_type == "cuda":
+        gpu_ok, gpu_result = check_nvidia_gpu()
+        if not gpu_ok:
+            if gpu_result == "no_cuda":
+                print("Error: No CUDA device. An NVIDIA GPU with compute capability 7.5+ is required.")
+            else:
+                _, major, minor = gpu_result
+                print(f"Error: Compute capability 7.5+ required (GPU: {major}.{minor}).")
+            sys.exit(1)
+
+        driver_ok, driver_info = check_gpu_driver_version()
+        if not driver_ok:
+            print(f"Error: GPU driver version check failed: {driver_info}")
+            print(f"Please update your NVIDIA driver to version {MIN_DRIVER_VERSION} or newer.")
+            sys.exit(1)
+
+        if sys.platform == "win32":
+            sysmem_ok, sysmem_info = check_windows_nvidia_sysmem_fallback_policy()
+            if not sysmem_ok:
+                print(f"Warning: CUDA Sysmem Fallback Policy: {sysmem_info}")
+    elif device_type == "xpu":
+        intel_ok, intel_info = check_intel_gpu()
+        if not intel_ok:
+            print(f"Error: Intel GPU (xpu) is not usable: {intel_info}")
+            print("Check the Intel compute runtime install (intel-compute-runtime, level-zero-loader).")
+            print(
+                "If torch.xpu aborts via Level Zero on Battlemage, try "
+                "ONEAPI_DEVICE_SELECTOR=opencl:gpu (intel/compute-runtime#922)."
+            )
+            sys.exit(1)
+    else:
+        print("Warning: running on CPU. This will be extremely slow; use --device cuda:N or xpu:N.")
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
@@ -592,7 +644,18 @@ def main() -> None:
     if codec not in {"hevc", "h264", "av1"}:
         raise ValueError(f"Unsupported codec: {codec} (supported: hevc, h264, av1)")
 
-    encoder_settings = validate_encoder_settings(parse_encoder_settings(str(args.encoder_settings)), codec=codec)
+    # Validate against the backend that will actually encode on this device
+    # (nvenc/qsv/software option names differ), so bad settings fail here
+    # rather than mid-export.
+    from jasna.media.video_encoder import encoder_specs_for_device
+
+    codec_spec = encoder_specs_for_device(torch.device(str(args.device)))[codec]
+    encoder_settings = validate_encoder_settings(
+        parse_encoder_settings(str(args.encoder_settings)),
+        codec=codec,
+        supported=codec_spec.supported_settings,
+        scope_name=codec_spec.encoder_name,
+    )
 
     batch_size = int(args.batch_size)
     if batch_size <= 0:
@@ -611,7 +674,7 @@ def main() -> None:
         raise ValueError("--temporal-overlap must satisfy 2*--temporal-overlap < --max-clip-size")
 
     device = torch.device(str(args.device))
-    fp16 = bool(args.fp16)
+    fp16 = resolve_fp16(args.fp16, device)
     detection_score_threshold = float(args.detection_score_threshold)
     if not (0.0 <= detection_score_threshold <= 1.0):
         raise ValueError("--detection-score-threshold must be in [0, 1]")
@@ -644,7 +707,7 @@ def main() -> None:
     ))
     use_tensorrt = compile_result.use_basicvsrpp_tensorrt
 
-    with torch.cuda.device(device):
+    with device_ctx(device):
         if secondary_name == "none":
             secondary_restorer = None
         elif secondary_name == "tvai":
@@ -657,9 +720,13 @@ def main() -> None:
                 num_workers=int(args.tvai_workers),
             )
         elif secondary_name == "unet-4x":
+            if not supports_tensorrt(device):
+                raise ValueError("--secondary-restoration unet-4x requires an NVIDIA GPU with TensorRT installed (engine-only, for now)")
             from jasna.restorer.unet4x_secondary_restorer import Unet4xSecondaryRestorer
             secondary_restorer = Unet4xSecondaryRestorer(device=device, fp16=fp16)
         elif secondary_name == "rtx-super-res":
+            if not supports_nvvfx(device):
+                raise ValueError("--secondary-restoration rtx-super-res requires an NVIDIA GPU with nvidia-vfx installed")
             from jasna.restorer.rtx_superres_secondary_restorer import RtxSuperresSecondaryRestorer
             rtx_denoise = str(args.rtx_denoise).lower()
             rtx_deblur = str(args.rtx_deblur).lower()

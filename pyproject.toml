@@ -8,11 +8,9 @@ version = "0.8.0"
 description = "Jasna"
 readme = "README.md"
 requires-python = ">=3.13"
+# Hardware-neutral dependencies only; pick exactly one GPU stack via the
+# "nvidia" or "intel" extra (see README / docs/intel_arc_server.md).
 dependencies = [
-  "torch==2.12.0+cu130",
-  "torchvision==0.27.0+cu130",
-  "tensorrt==10.16.1.11",
-  "torch-tensorrt==2.12.0",
   # current_ctx support is merged upstream for PyAV 18.1.0 but is not published yet.
   # Linux releases override this with the pinned upstream-main wheel in build_linux.sh;
   # remove that override and require av>=18.1 once the release reaches PyPI.
@@ -29,7 +27,6 @@ dependencies = [
   "customtkinter",
   "tkinterdnd2",
   "ultralytics",
-  "nvidia-vfx",
   "onnx",
   "cryptography>=42",
 ]
@@ -38,6 +35,19 @@ dependencies = [
 jasna = "jasna.main:main"
 
 [project.optional-dependencies]
+nvidia = [
+  "torch==2.12.0+cu130",
+  "torchvision==0.27.0+cu130",
+  "tensorrt==10.16.1.11",
+  "torch-tensorrt==2.12.0",
+  "nvidia-vfx",
+]
+intel = [
+  "torch==2.12.0+xpu",
+  "torchvision==0.27.0+xpu",
+  "pytorch-triton-xpu",
+  "openvino>=2026.2",
+]
 dev = [
   "nuitka>=2.4",
   "pytest",
@@ -47,8 +57,33 @@ dev = [
   "ninja",
 ]
 
+[tool.uv]
+conflicts = [[{ extra = "nvidia" }, { extra = "intel" }]]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu130", extra = "nvidia" },
+  { index = "pytorch-xpu", extra = "intel" },
+]
+torchvision = [
+  { index = "pytorch-cu130", extra = "nvidia" },
+  { index = "pytorch-xpu", extra = "intel" },
+]
+torch-tensorrt = [{ index = "pytorch-cu130", extra = "nvidia" }]
+pytorch-triton-xpu = [{ index = "pytorch-xpu", extra = "intel" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-xpu"
+url = "https://download.pytorch.org/whl/xpu"
+explicit = true
+
 [tool.setuptools]
-packages = ["jasna", "jasna.gui", "jasna.mosaic", "jasna.restorer", "jasna.trt"]
+packages = ["jasna", "jasna.gui", "jasna.mosaic", "jasna.ov", "jasna.restorer", "jasna.trt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

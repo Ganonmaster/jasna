@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 from jasna._frozen import is_frozen
@@ -27,6 +28,68 @@ def check_nvidia_gpu() -> tuple[bool, str] | tuple[bool, tuple[str, int, int]]:
     if capability < MIN_GPU_COMPUTE:
         return False, ("compute_too_low", capability[0], capability[1])
     return True, torch.cuda.get_device_name(0)
+
+
+def check_intel_gpu() -> tuple[bool, str]:
+    """Return (True, gpu_name) or (False, reason). Probes in a subprocess."""
+    try:
+        from jasna.device_backend import probe_xpu_subprocess
+    except ImportError as e:
+        return False, str(e)
+    return probe_xpu_subprocess()
+
+
+@lru_cache(maxsize=4)
+def check_qsv_available(encoder: str = "h264_qsv") -> tuple[bool, str]:
+    """Check that PyAV can actually open a QSV encoder session.
+
+    torch.xpu being usable says nothing about the media stack; opening an
+    encoder context is the only reliable probe (it initializes the VPL/VAAPI
+    session, failing cleanly when the runtime or ffmpeg build lacks QSV).
+    """
+    try:
+        import av
+    except ImportError as e:
+        return False, f"PyAV not available: {e}"
+    if encoder not in av.codecs_available:
+        return False, f"{encoder} not in PyAV codecs (FFmpeg built without libvpl?)"
+    try:
+        from fractions import Fraction
+
+        ctx = av.Codec(encoder, "w").create()
+        ctx.width = 256
+        ctx.height = 256
+        ctx.pix_fmt = "nv12"
+        ctx.time_base = Fraction(1, 30)
+        ctx.framerate = Fraction(30, 1)
+        ctx.open()
+    except Exception as e:
+        return False, f"{encoder} failed to open: {e}"
+    return True, encoder
+
+
+def check_gpu_preflight(device_spec: str) -> tuple[bool, str]:
+    """Coarse device preflight for secondary CLIs (benchmarks etc.).
+
+    jasna.main has its own preflight with friendlier per-failure messages.
+    """
+    from jasna.device_backend import resolve_device
+
+    try:
+        device = resolve_device(str(device_spec))
+    except ValueError as e:
+        return False, str(e)
+    if device.type == "cuda":
+        gpu_ok, gpu_result = check_nvidia_gpu()
+        if not gpu_ok:
+            if gpu_result == "no_cuda":
+                return False, "No CUDA device. An NVIDIA GPU with compute capability 7.5+ is required."
+            _, major, minor = gpu_result
+            return False, f"Compute capability 7.5+ required (GPU: {major}.{minor})."
+        return True, str(gpu_result)
+    if device.type == "xpu":
+        return check_intel_gpu()
+    return True, "CPU (no GPU acceleration)"
 
 
 def _bundled_exe_filename(name: str) -> str:

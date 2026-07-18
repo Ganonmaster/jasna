@@ -11,6 +11,7 @@ from tempfile import TemporaryDirectory
 
 from jasna.blend_buffer import BlendBuffer
 from jasna.crop_buffer import CropBuffer
+from jasna.device_backend import gpu_mod
 from jasna.frame_queue import FrameQueue
 
 import psutil
@@ -367,7 +368,7 @@ class Pipeline:
         def _async_secondary_thread():
             nonlocal starvation_stats
             try:
-                torch.cuda.set_device(device)
+                gpu_mod(device).set_device(device)
                 starvation_stats = self._run_secondary_loop(secondary_queue, encode_queue, debug_memory, clip_queue, primary_idle_event)
             except BaseException as e:
                 log.exception("[secondary-async] thread crashed")
@@ -462,7 +463,7 @@ class Pipeline:
 
         _process = psutil.Process(os.getpid())
         try:
-            free, total = torch.cuda.mem_get_info(device)
+            free, total = gpu_mod(device).mem_get_info(device)
             vram_used = total - free
             log.info("VRAM usage at end — %.1f MiB", vram_used / (1024 ** 2))
         except Exception:
@@ -488,9 +489,10 @@ class Pipeline:
         del blend_buffer, crop_buffers
         del error_holder, threads
         gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-        torch.cuda.reset_peak_memory_stats(self.device)
+        gpu = gpu_mod(self.device)
+        gpu.empty_cache()
+        gpu.ipc_collect()
+        gpu.reset_peak_memory_stats(self.device)
 
         if err is not None:
             raise err

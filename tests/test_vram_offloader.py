@@ -114,7 +114,7 @@ class TestVramOffloaderOffload:
             vram_limit=0.001,
             safetynet=0,
         )
-        # device_type stays "cuda" (default) so CPU tensors are not considered on-device
+        # device_type is None for a cpu pipeline, so CPU tensors are not considered on-device
         freed = offloader._offload(1)
         assert freed == 0
 
@@ -230,9 +230,12 @@ class TestVramOffloaderLifecycle:
         offloader.stop()
         assert not offloader._thread.is_alive()
 
-    @patch("jasna.vram_offloader.torch.cuda.mem_get_info", return_value=(0, 2_000_000))
-    @patch("jasna.vram_offloader.torch.cuda.empty_cache")
-    def test_run_loop_triggers_offload_and_empty_cache(self, mock_empty_cache, mock_mem_info):
+    @patch("jasna.vram_offloader.gpu_mod")
+    def test_run_loop_triggers_offload_and_empty_cache(self, mock_gpu_mod):
+        backend = MagicMock()
+        backend.mem_get_info.return_value = (0, 2_000_000)
+        mock_gpu_mod.return_value = backend
+
         bb = BlendBuffer(device=torch.device("cpu"))
         sr = _make_sr(track_id=1, start_frame=0, frame_count=1)
         bb.register_frame(0, {1})
@@ -254,7 +257,7 @@ class TestVramOffloaderLifecycle:
 
         assert offloader.stats.sample_count > 0
         assert offloader.stats.offload_count >= 1
-        mock_empty_cache.assert_called()
+        backend.empty_cache.assert_called()
 
 
 class TestEncodeStallDetection:

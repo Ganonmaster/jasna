@@ -135,9 +135,20 @@ class TestValidateEncoderSettingsPerCodec:
     def test_profile_accepted_for_hevc_and_h264(self, codec):
         assert validate_encoder_settings({"profile": "x"}, codec=codec) == {"profile": "x"}
 
-    def test_profile_rejected_for_av1(self):
-        with pytest.raises(ValueError, match="for codec av1.*profile"):
-            validate_encoder_settings({"profile": "main"}, codec="av1")
+    def test_profile_for_av1_is_backend_specific(self):
+        # The codec-level check is a cross-backend union (av1_qsv consumes
+        # profile), so it passes here; av1_nvenc-strict validation still
+        # rejects it at encoder construction via the spec's supported set.
+        from jasna.media import NVENC_ENCODER_SETTINGS_BY_CODEC
+
+        assert validate_encoder_settings({"profile": "main"}, codec="av1") == {"profile": "main"}
+        with pytest.raises(ValueError, match=r"profile.*av1_nvenc"):
+            validate_encoder_settings(
+                {"profile": "main"},
+                codec="av1",
+                supported=NVENC_ENCODER_SETTINGS_BY_CODEC["av1"],
+                scope_name="av1_nvenc",
+            )
 
     @pytest.mark.parametrize("codec", ["hevc", "h264"])
     def test_underscore_aq_alias_accepted_for_hevc_and_h264(self, codec):

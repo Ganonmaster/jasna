@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+from jasna.device_backend import gpu_mod
 from jasna.restorer.basicvrspp_tenorrt_compilation import basicvsrpp_startup_policy
 from jasna.restorer.basicvsrpp_mosaic_restorer import BasicvsrppMosaicRestorer
 from jasna.restorer.basicvsrpp_sub_engines import BasicVSRPlusPlusNetSplit
@@ -197,7 +198,7 @@ def benchmark_basicvsrpp_restoration(
             for _ in range(RUNS):
                 start = time.perf_counter()
                 restorer.raw_process(video)
-                torch.cuda.synchronize()
+                gpu_mod(device).synchronize()
                 durations.append(time.perf_counter() - start)
 
         med = statistics.median(durations)

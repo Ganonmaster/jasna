@@ -9,9 +9,17 @@ import torch
 logger = logging.getLogger(__name__)
 from torch.nn import functional as F
 
-from jasna.engine_paths import get_onnx_tensorrt_engine_path
-from jasna.trt.trt_runner import TrtRunner
+from jasna.engine_paths import get_onnx_tensorrt_engine_path, ov_cache_dir
 from jasna.mosaic.detections import Detections
+
+# TensorRT ships only in Nvidia installs; non-CUDA devices use OvRunner.
+# Both kept as module attributes for test patching.
+from jasna.ov.ov_runner import OvRunner
+
+try:
+    from jasna.trt.trt_runner import TrtRunner
+except ImportError:
+    TrtRunner = None
 
 
 def compile_rfdetr_engine(
@@ -28,6 +36,30 @@ def compile_rfdetr_engine(
         fp16=bool(fp16),
         workspace_gb=20,
     )
+
+
+def warmup_rfdetr_openvino(
+    onnx_path: Path,
+    batch_size: int,
+    resolution: int = 768,
+) -> None:
+    """Compile the RF-DETR model for the Intel GPU, populating the OV cache.
+
+    The pipeline would compile lazily on first inference anyway; doing it in
+    the engine-compilation subprocess keeps the first-run "compiling…"
+    feedback and frees the transient compile memory before processing starts.
+    Precision is fixed (f16 hint, matching runtime construction), so the
+    warm-up blob is exactly the one the pipeline will load.
+    """
+    runner = OvRunner(
+        onnx_path,
+        input_shapes=[(int(batch_size), 3, int(resolution), int(resolution))],
+        device=torch.device("cpu"),
+        ov_device="GPU",
+        cache_dir=ov_cache_dir(),
+        fp16=True,
+    )
+    runner.close()
 
 
 class RfDetrMosaicDetectionModel:
@@ -53,19 +85,39 @@ class RfDetrMosaicDetectionModel:
         self.score_threshold = float(score_threshold)
         self.max_select = int(max_select)
 
-        self.engine_path = get_onnx_tensorrt_engine_path(
-            self.onnx_path, batch_size=self.batch_size, fp16=bool(fp16),
-        )
-        if not self.engine_path.exists():
-            raise FileNotFoundError(
-                f"RF-DETR engine not found: {self.engine_path}. "
-                "Run engine compilation first via ensure_engines_compiled()."
+        input_shapes = [(self.batch_size, 3, self.resolution, self.resolution)]
+        if self.device.type == "cuda":
+            if TrtRunner is None:
+                raise RuntimeError("TensorRT is not installed; cuda devices require an Nvidia install")
+            self.engine_path = get_onnx_tensorrt_engine_path(
+                self.onnx_path, batch_size=self.batch_size, fp16=bool(fp16),
             )
-        self.runner = TrtRunner(
-            self.engine_path,
-            input_shapes=[(self.batch_size, 3, self.resolution, self.resolution)],
-            device=self.device,
-        )
+            if not self.engine_path.exists():
+                raise FileNotFoundError(
+                    f"RF-DETR engine not found: {self.engine_path}. "
+                    "Run engine compilation first via ensure_engines_compiled()."
+                )
+            self.runner = TrtRunner(
+                self.engine_path,
+                input_shapes=input_shapes,
+                device=self.device,
+            )
+            loaded_from = self.engine_path
+        else:
+            self.engine_path = None
+            ov_device = "GPU" if self.device.type == "xpu" else "CPU"
+            self.runner = OvRunner(
+                self.onnx_path,
+                input_shapes=input_shapes,
+                device=self.device,
+                ov_device=ov_device,
+                cache_dir=ov_cache_dir(),
+                # The GPU plugin always gets the f16 hint (the analog of the
+                # fp16 TRT engines on cuda); the pipeline --fp16 flag governs
+                # restoration dtype, not detection precision.
+                fp16=ov_device == "GPU",
+            )
+            loaded_from = self.onnx_path
         self._input_name = self.runner.input_names[0]
         self.input_dtype = self.runner.input_dtypes[self._input_name]
 
@@ -74,7 +126,7 @@ class RfDetrMosaicDetectionModel:
         )
         self.masks_out = next(k for k in self.runner.output_names if self.runner.outputs[k].ndim == 4)
         self.logits_out = next(k for k in self.runner.output_names if k not in {self.boxes_out, self.masks_out})
-        logger.info("RF-DETR detection model loaded: %s (batch_size=%d)", self.engine_path, self.batch_size)
+        logger.info("RF-DETR detection model loaded: %s (batch_size=%d)", loaded_from, self.batch_size)
 
     def close(self) -> None:
         if self.runner is not None:

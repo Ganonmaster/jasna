@@ -7,16 +7,25 @@ import threading
 from collections import deque
 from dataclasses import dataclass, field
 from fractions import Fraction
+from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
 import av
+import numpy as np
 import torch
 from av.video.frame import CudaContext
 from av.video.reformatter import Colorspace as AvColorspace, ColorRange as AvColorRange
 
-from jasna.media import SUPPORTED_ENCODER_SETTINGS_BY_CODEC, VideoMetadata, validate_encoder_settings
+from jasna.device_backend import gpu_mod, host_buffer, hw_media, is_gpu
+from jasna.media import (
+    NVENC_ENCODER_SETTINGS_BY_CODEC,
+    QSV_ENCODER_SETTINGS_BY_CODEC,
+    SOFTWARE_ENCODER_SETTINGS_BY_CODEC,
+    VideoMetadata,
+    validate_encoder_settings,
+)
 from jasna.media.audio_utils import needs_audio_reencode
 from jasna.media.lut import GpuLutApplier, parse_cube_file
 from jasna.media.rgb_to_nv12 import (
@@ -112,9 +121,17 @@ DEFAULT_AV1_ENCODER_OPTIONS: dict[str, str] = {
 class EncoderSpec:
     name: str
     encoder_name: str
-    frame_format: str  # PyAV hardware-frame software format: "nv12" or "p010le"
+    frame_format: str  # packed tensor layout produced by the RGB converters: "nv12" or "p010le"
     default_options: Mapping[str, str]
     ten_bit: bool
+    # The codec context pix_fmt: "cuda" for NVENC hardware frames; for other
+    # backends the format the encoder consumes (PyAV reformats automatically
+    # when it differs from frame_format, e.g. p010le -> yuv420p10le for x265).
+    encoder_pix_fmt: str = "cuda"
+    # encoder_pix_fmt when the spec is downgraded to 8-bit NV12 frames
+    # (match_input_bit_depth with an 8-bit source), declared explicitly per
+    # backend instead of inferred from string patterns.
+    encoder_pix_fmt_8bit: str = "cuda"
     supported_settings: frozenset[str] = field(default_factory=frozenset)
 
 
@@ -125,7 +142,8 @@ ENCODER_SPECS: dict[str, EncoderSpec] = {
         frame_format="p010le",
         default_options=MappingProxyType(DEFAULT_ENCODER_OPTIONS),
         ten_bit=True,
-        supported_settings=SUPPORTED_ENCODER_SETTINGS_BY_CODEC["hevc"],
+        encoder_pix_fmt="cuda",
+        supported_settings=NVENC_ENCODER_SETTINGS_BY_CODEC["hevc"],
     ),
     "h264": EncoderSpec(
         name="h264",
@@ -133,7 +151,8 @@ ENCODER_SPECS: dict[str, EncoderSpec] = {
         frame_format="nv12",
         default_options=MappingProxyType(DEFAULT_H264_ENCODER_OPTIONS),
         ten_bit=False,
-        supported_settings=SUPPORTED_ENCODER_SETTINGS_BY_CODEC["h264"],
+        encoder_pix_fmt="cuda",
+        supported_settings=NVENC_ENCODER_SETTINGS_BY_CODEC["h264"],
     ),
     "av1": EncoderSpec(
         name="av1",
@@ -141,11 +160,133 @@ ENCODER_SPECS: dict[str, EncoderSpec] = {
         frame_format="p010le",
         default_options=MappingProxyType(DEFAULT_AV1_ENCODER_OPTIONS),
         ten_bit=True,
-        supported_settings=SUPPORTED_ENCODER_SETTINGS_BY_CODEC["av1"],
+        encoder_pix_fmt="cuda",
+        supported_settings=NVENC_ENCODER_SETTINGS_BY_CODEC["av1"],
+    ),
+}
+
+# QSV (Intel Arc) option sets are first-cut placeholders pending VMAF tuning
+# against the NVENC defaults above. ICQ rate control via global_quality.
+DEFAULT_QSV_HEVC_OPTIONS: dict[str, str] = {
+    "preset": "slow",
+    "global_quality": "22",
+    "profile": "main10",
+    "g": "250",
+    "bf": "4",
+}
+DEFAULT_QSV_H264_OPTIONS: dict[str, str] = {
+    "preset": "slow",
+    "global_quality": "23",
+    "g": "250",
+    "bf": "4",
+}
+DEFAULT_QSV_AV1_OPTIONS: dict[str, str] = {
+    "preset": "slow",
+    "global_quality": "30",
+    "g": "250",
+}
+
+ENCODER_SPECS_QSV: dict[str, EncoderSpec] = {
+    "hevc": EncoderSpec(
+        name="hevc",
+        encoder_name="hevc_qsv",
+        frame_format="p010le",
+        default_options=MappingProxyType(DEFAULT_QSV_HEVC_OPTIONS),
+        ten_bit=True,
+        encoder_pix_fmt="p010le",
+        encoder_pix_fmt_8bit="nv12",
+        supported_settings=QSV_ENCODER_SETTINGS_BY_CODEC["hevc"],
+    ),
+    "h264": EncoderSpec(
+        name="h264",
+        encoder_name="h264_qsv",
+        frame_format="nv12",
+        default_options=MappingProxyType(DEFAULT_QSV_H264_OPTIONS),
+        ten_bit=False,
+        encoder_pix_fmt="nv12",
+        encoder_pix_fmt_8bit="nv12",
+        supported_settings=QSV_ENCODER_SETTINGS_BY_CODEC["h264"],
+    ),
+    "av1": EncoderSpec(
+        name="av1",
+        encoder_name="av1_qsv",
+        frame_format="p010le",
+        default_options=MappingProxyType(DEFAULT_QSV_AV1_OPTIONS),
+        ten_bit=True,
+        encoder_pix_fmt="p010le",
+        encoder_pix_fmt_8bit="nv12",
+        supported_settings=QSV_ENCODER_SETTINGS_BY_CODEC["av1"],
+    ),
+}
+
+# Software encoders keep cpu-device runs and QSV-less setups working; quality
+# placeholders, not tuned. x265/svtav1 read yuv420p10le, PyAV reformats P010.
+DEFAULT_SOFTWARE_HEVC_OPTIONS: dict[str, str] = {"preset": "medium", "crf": "21", "g": "250"}
+DEFAULT_SOFTWARE_H264_OPTIONS: dict[str, str] = {"preset": "medium", "crf": "20", "g": "250"}
+DEFAULT_SOFTWARE_AV1_OPTIONS: dict[str, str] = {"preset": "6", "crf": "30", "g": "250"}
+
+ENCODER_SPECS_SOFTWARE: dict[str, EncoderSpec] = {
+    "hevc": EncoderSpec(
+        name="hevc",
+        encoder_name="libx265",
+        frame_format="p010le",
+        default_options=MappingProxyType(DEFAULT_SOFTWARE_HEVC_OPTIONS),
+        ten_bit=True,
+        encoder_pix_fmt="yuv420p10le",
+        encoder_pix_fmt_8bit="yuv420p",
+        supported_settings=SOFTWARE_ENCODER_SETTINGS_BY_CODEC["hevc"],
+    ),
+    "h264": EncoderSpec(
+        name="h264",
+        encoder_name="libx264",
+        frame_format="nv12",
+        default_options=MappingProxyType(DEFAULT_SOFTWARE_H264_OPTIONS),
+        ten_bit=False,
+        encoder_pix_fmt="nv12",
+        encoder_pix_fmt_8bit="nv12",
+        supported_settings=SOFTWARE_ENCODER_SETTINGS_BY_CODEC["h264"],
+    ),
+    "av1": EncoderSpec(
+        name="av1",
+        encoder_name="libsvtav1",
+        frame_format="p010le",
+        default_options=MappingProxyType(DEFAULT_SOFTWARE_AV1_OPTIONS),
+        ten_bit=True,
+        encoder_pix_fmt="yuv420p10le",
+        encoder_pix_fmt_8bit="yuv420p",
+        supported_settings=SOFTWARE_ENCODER_SETTINGS_BY_CODEC["av1"],
     ),
 }
 
 _CODEC_MAP = {spec.name: spec.encoder_name for spec in ENCODER_SPECS.values()}
+
+
+@lru_cache(maxsize=1)
+def _qsv_encoders_usable() -> bool:
+    from jasna.os_utils import check_qsv_available
+
+    ok, info = check_qsv_available()
+    if not ok:
+        logger.warning("QSV encoders unavailable (%s); falling back to software encoding", info)
+    return ok
+
+
+def encoder_specs_for_device(device: torch.device) -> dict[str, EncoderSpec]:
+    media = hw_media(device)
+    if media == "nvdec_nvenc":
+        return ENCODER_SPECS
+    if media == "qsv" and _qsv_encoders_usable():
+        return ENCODER_SPECS_QSV
+    return ENCODER_SPECS_SOFTWARE
+
+
+def _downgraded_pix_fmt(spec: EncoderSpec) -> str:
+    """encoder_pix_fmt for a spec forced from 10-bit down to 8-bit NV12."""
+    if spec.encoder_pix_fmt == "cuda":
+        return "cuda"
+    if spec.encoder_pix_fmt == spec.frame_format:  # direct-consuming (QSV)
+        return "nv12"
+    return "yuv420p"  # software 8-bit hevc/av1
 
 # ITU-T H.273 matrix, primaries, and transfer-characteristic code points.
 _COLOR_TAGS = {
@@ -190,7 +331,7 @@ def _option_value(value: object) -> str:
     return str(value)
 
 
-class NvidiaVideoEncoder:
+class VideoEncoder:
     def __init__(
         self,
         file: str,
@@ -206,9 +347,10 @@ class NvidiaVideoEncoder:
         match_input_bit_depth: bool = False,
         smart_fragment: bool = False,
     ):
-        if codec not in ENCODER_SPECS:
+        specs = encoder_specs_for_device(device)
+        if codec not in specs:
             raise ValueError(f"Unsupported codec: {codec}")
-        spec = ENCODER_SPECS[codec]
+        spec = specs[codec]
         if match_input_bit_depth and codec in {"hevc", "av1"} and not metadata.is_10bit:
             options = dict(spec.default_options)
             if codec == "hevc":
@@ -219,6 +361,8 @@ class NvidiaVideoEncoder:
                 frame_format="nv12",
                 default_options=MappingProxyType(options),
                 ten_bit=False,
+                encoder_pix_fmt=spec.encoder_pix_fmt_8bit,
+                encoder_pix_fmt_8bit=spec.encoder_pix_fmt_8bit,
                 supported_settings=spec.supported_settings,
             )
         converter_map = _COLOR_CONVERTERS if spec.frame_format == "p010le" else _COLOR_CONVERTERS_NV12
@@ -226,7 +370,15 @@ class NvidiaVideoEncoder:
         if converter is None:
             raise ValueError(f"Unsupported color space or color range: {metadata.color_space} {metadata.color_range}")
         if encoder_settings:
-            validate_encoder_settings(encoder_settings, codec=codec)
+            # Strict per-backend check: the CLI already validated against the
+            # cross-backend union, this rejects e.g. nvenc-only options on QSV
+            # up front instead of mid-encode with a partial output file.
+            validate_encoder_settings(
+                encoder_settings,
+                codec=codec,
+                supported=spec.supported_settings,
+                scope_name=spec.encoder_name,
+            )
 
         self.metadata = metadata
         self.device = device
@@ -291,7 +443,9 @@ class NvidiaVideoEncoder:
         ctx = out_v.codec_context
         ctx.time_base = self.metadata.time_base
         ctx.framerate = self.output_fps
-        ctx.pix_fmt = "cuda"
+        # Never leave PyAV's yuv420p default in place: NVENC needs the "cuda"
+        # hardware format and QSV rejects yuv420p outright (wants nv12/p010le).
+        ctx.pix_fmt = self.spec.encoder_pix_fmt
         if self.smart_fragment:
             from av.codec.context import Flags
 
@@ -314,12 +468,15 @@ class NvidiaVideoEncoder:
         # initialized it; current_ctx leaves the context and its flags alone.
         # Keeping conversion and NVENC in one context also avoids a ~500 MiB
         # secondary CUDA context and cross-context scheduling overhead.
-        self._cuda_ctx = CudaContext(
-            device_id=self.device.index or 0,
-            primary_ctx=False,
-            current_ctx=True,
-        )
-        self.stream = torch.cuda.Stream(self.device)
+        self._cuda_ctx = None
+        if self.device.type == "cuda":
+            self._cuda_ctx = CudaContext(
+                device_id=self.device.index or 0,
+                primary_ctx=False,
+                current_ctx=True,
+            )
+        self.stream = gpu_mod(self.device).Stream(self.device)
+        self._host_packed: torch.Tensor | None = None
         self.pts_heap: list[int] = []
         self.frame_buffer: deque = deque()
         self._lut_flags.clear()
@@ -330,7 +487,7 @@ class NvidiaVideoEncoder:
 
         self._stop_sentinel = object()
         self._encode_queue: queue.Queue = queue.Queue(maxsize=self.BUFFER_MAX_SIZE)
-        self._encode_thread = threading.Thread(target=self._encode_worker, name="NvidiaVideoEncoderWorker", daemon=True)
+        self._encode_thread = threading.Thread(target=self._encode_worker, name="VideoEncoderWorker", daemon=True)
         self._encode_thread.start()
         return self
 
@@ -384,8 +541,7 @@ class NvidiaVideoEncoder:
             raise self._worker_error
 
     def _encode_worker(self):
-        if self.device.type == "cuda":
-            torch.cuda.set_device(self.device)
+        gpu_mod(self.device).set_device(self.device)
 
         while True:
             item = self._encode_queue.get()
@@ -410,9 +566,10 @@ class NvidiaVideoEncoder:
         frame: torch.Tensor,
         pts: int,
         apply_lut: bool = True,
-    ) -> tuple[torch.Tensor, int, bool, torch.cuda.Event]:
-        producer_stream = torch.cuda.current_stream(self.device)
-        ready_event = torch.cuda.Event()
+    ):
+        gpu = gpu_mod(self.device)
+        producer_stream = gpu.current_stream(self.device)
+        ready_event = gpu.Event()
         producer_stream.record_event(ready_event)
         return frame, pts, bool(apply_lut), ready_event
 
@@ -421,10 +578,11 @@ class NvidiaVideoEncoder:
         frame: torch.Tensor,
         pts: int,
         apply_lut: bool,
-        ready_event: torch.cuda.Event,
+        ready_event,
     ) -> None:
         self.stream.wait_event(ready_event)
-        frame.record_stream(self.stream)
+        if is_gpu(self.device):
+            frame.record_stream(self.stream)
         self._encode_frame(frame, pts, apply_lut=apply_lut)
 
     def _validate_encoder_options(self):
@@ -513,7 +671,7 @@ class NvidiaVideoEncoder:
 
     def _encoder_open_error(self, exc: Exception) -> RuntimeError:
         try:
-            gpu = torch.cuda.get_device_name(self.device)
+            gpu = gpu_mod(self.device).get_device_name(self.device)
         except Exception:
             gpu = str(self.device)
         message = (
@@ -525,34 +683,69 @@ class NvidiaVideoEncoder:
         return RuntimeError(message)
 
     def _encode_frame(self, frame: torch.Tensor, pts: int, *, apply_lut: bool = True):
-        with torch.cuda.stream(self.stream):
+        gpu = gpu_mod(self.device)
+        with gpu.stream(self.stream):
             if apply_lut and self._lut_applier is not None:
                 frame = self._lut_applier.apply(frame)
             packed = self._to_yuv(frame)
+            if self.device.type != "cuda" and packed.device.type != "cpu":
+                # Reusable pinned buffer: a fresh pageable tensor per frame
+                # would force a synchronous D2H copy and churn the allocator.
+                if (
+                    self._host_packed is None
+                    or self._host_packed.shape != packed.shape
+                    or self._host_packed.dtype != packed.dtype
+                ):
+                    self._host_packed = host_buffer(tuple(packed.shape), packed.dtype, want_pinned=True)
+                self._host_packed.copy_(packed, non_blocking=True)
+                packed = self._host_packed
 
         height = self.metadata.video_height
-        # NVENC consumes these pointers asynchronously, so finish the conversion
-        # before constructing the hardware frame on the shared CUDA context.
-        self.stream.synchronize()
-        if self.spec.frame_format == "p010le":
-            planes = [packed[:height].view(torch.uint16), packed[height:].view(torch.uint16)]
+        if self.device.type == "cuda":
+            # NVENC consumes these pointers asynchronously, so finish the conversion
+            # before constructing the hardware frame on the shared CUDA context.
+            self.stream.synchronize()
+            if self.spec.frame_format == "p010le":
+                planes = [packed[:height].view(torch.uint16), packed[height:].view(torch.uint16)]
+            else:
+                planes = [packed[:height], packed[height:]]
+            out_frame = av.VideoFrame.from_dlpack(
+                planes,
+                format=self.spec.frame_format,
+                cuda_context=self._cuda_ctx,
+            )
         else:
-            planes = [packed[:height], packed[height:]]
-        hw_frame = av.VideoFrame.from_dlpack(
-            planes,
-            format=self.spec.frame_format,
-            cuda_context=self._cuda_ctx,
-        )
-        hw_frame.pts = pts
-        hw_frame.time_base = self.metadata.time_base
+            # QSV and software encoders consume system-memory frames; the
+            # packed tensor was staged to the host on the encode stream above.
+            self.stream.synchronize()
+            out_frame = self._build_host_frame(packed, height)
+        out_frame.pts = pts
+        out_frame.time_base = self.metadata.time_base
         try:
-            packets = self.out_stream.encode(hw_frame)
+            packets = self.out_stream.encode(out_frame)
         except av.FFmpegError as exc:
             if not self._video_started:
                 raise self._encoder_open_error(exc) from exc
             raise
         for packet in packets:
             self._mux_video(packet)
+
+    def _build_host_frame(self, packed: torch.Tensor, height: int) -> av.VideoFrame:
+        """Packed host NV12/P010 rows -> an av.VideoFrame in system memory.
+
+        The packed layout is (H + H/2, W) uint8 for NV12 and (H + H/2, W)
+        int16 for P010. Rows are copied as raw bytes because the frame's
+        line_size may include padding beyond the visible width.
+        """
+        vf = av.VideoFrame(self.metadata.video_width, height, self.spec.frame_format)
+        packed_bytes = packed if packed.dtype == torch.uint8 else packed.view(torch.uint8)
+        y_src = packed_bytes[:height].numpy()
+        uv_src = packed_bytes[height:].numpy()
+        row_bytes = y_src.shape[1]
+        y_plane, uv_plane = vf.planes
+        np.frombuffer(y_plane, np.uint8).reshape(-1, y_plane.line_size)[:, :row_bytes] = y_src
+        np.frombuffer(uv_plane, np.uint8).reshape(-1, uv_plane.line_size)[:, :row_bytes] = uv_src
+        return vf
 
     def encode(self, frame: torch.Tensor, pts: int, *, apply_lut: bool = True):
         if self._worker_error is not None:
@@ -565,3 +758,8 @@ class NvidiaVideoEncoder:
         self._lut_flags.append(bool(apply_lut))
         self.pts_set.add(pts)
         self._process_buffer()
+
+
+# Historical name, kept for existing imports and test patch targets; the class
+# has been device-generic (NVENC / QSV / software) since the Intel Arc port.
+NvidiaVideoEncoder = VideoEncoder
