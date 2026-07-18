@@ -342,15 +342,21 @@ def hw_media(device: "torch.device | str") -> str | None:
 
 
 def deform_conv2d_backend(device: "torch.device | str") -> str:
-    """"torchvision" (bit-identical current behavior) or "grid_sample".
+    """"torchvision" (native kernel) or "grid_sample" (pure-torch composition).
 
-    The grid_sample implementation is the planned XPU-native path; until it
-    lands, xpu also returns "torchvision" and relies on PyTorch's implicit
-    XPU->CPU fallback for the op (matching what upstream Lada ships).
+    torchvision has no XPU deform_conv2d kernel (pytorch/vision RFC #8679);
+    its dispatcher silently falls back to the fp32 CPU kernel, dragging the
+    alignment features through host memory every clip. The grid_sample
+    composition runs natively on xpu. cuda/cpu keep the torchvision kernel
+    (bit-identical to the original behavior). JASNA_DEFORM_BACKEND overrides
+    for A/B testing.
     """
     override = os.environ.get(DEFORM_BACKEND_ENV)
     if override in ("torchvision", "grid_sample"):
         return override
+    torch = _torch()
+    if torch.device(device).type == "xpu":
+        return "grid_sample"
     return "torchvision"
 
 

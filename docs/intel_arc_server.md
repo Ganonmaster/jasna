@@ -74,14 +74,19 @@ jasna --input in.mp4 --output out.mkv --device xpu:0
 Jasna warms up the OpenVINO engine cache (`model_weights/ov_cache/`) — the
 "Compiling the OpenVINO engine cache" step; later runs start fast.
 
-### fp16 note (BasicVSR++ / deform_conv2d)
+### Restoration precision (BasicVSR++ / deform_conv2d)
 
 `torchvision.ops.deform_conv2d` — the core alignment op of BasicVSR++ — has no
-XPU kernel yet (RFC pytorch/vision#8679). PyTorch transparently falls back to
-the CPU kernel for that op, which has no half-precision support. Jasna therefore
-defaults to **fp32** on xpu (`--fp16` is off unless forced). Expect this op to be
-the throughput bottleneck until the planned grid_sample-based XPU implementation
-lands (`JASNA_DEFORM_BACKEND` selects the implementation once it exists).
+XPU kernel (RFC pytorch/vision#8679), so on xpu Jasna substitutes a numerically
+equivalent grid_sample composition that runs natively on the GPU (parity vs the
+torchvision kernel verified to ~1e-5 fp32; whole-net agreement < 2e-3).
+`JASNA_DEFORM_BACKEND=torchvision` reverts to the old CPU-fallback behavior for
+A/B comparison.
+
+`--fp16` still defaults to **off** on xpu, but with the native deform path it is
+now safe to *try*: run a clip with `--fp16`, compare speed and eyeball quality
+against the fp32 output. If it holds up on your content, use it — fp16 roughly
+halves restoration memory traffic, which is the bottleneck on a 224 GB/s card.
 
 ## Known issues and workarounds
 
@@ -131,7 +136,7 @@ detection via OpenVINO are not the bottleneck; restoration is.
 | Decode | `*_qsv` copy-back decoders → pinned host buffer → xpu upload → torch YUV→RGB |
 | Detection (RF-DETR) | OpenVINO GPU plugin, fp16 hint, blob cache in `model_weights/ov_cache/` |
 | Detection (YOLO) | ultralytics eager PyTorch on xpu |
-| Restoration (BasicVSR++) | eager PyTorch on xpu, fp32 (deform_conv2d falls back to CPU) |
+| Restoration (BasicVSR++) | eager PyTorch on xpu (deform via native grid_sample composition; fp32 default, `--fp16` opt-in) |
 | Blend / VR180 / color / LUT | torch ops on xpu |
 | Encode | `*_qsv` (nv12/p010le system-memory frames), software encoders as fallback |
 | VRAM offloading | `torch.xpu.mem_get_info`-driven, same spill logic as CUDA |

@@ -190,8 +190,10 @@ def benchmark_basicvsrpp_restoration(
         print("\nNo split forward available (engines missing?), skipping detailed profiling.")
 
         durations: list[float] = []
+        # raw_process takes (C, H, W) tensors; the HWC layout previously here
+        # crashed the eager branch (never reached while TRT always engaged).
         video = [
-            torch.randint(0, 256, (SIZE, SIZE, 3), dtype=torch.uint8, device=device)
+            torch.randint(0, 256, (3, SIZE, SIZE), dtype=torch.uint8, device=device)
             for _ in range(CLIP_LENGTH)
         ]
         with torch.inference_mode():
