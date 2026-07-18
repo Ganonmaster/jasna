@@ -614,7 +614,7 @@ def main() -> None:
         raise ValueError("--temporal-overlap must satisfy 2*--temporal-overlap < --max-clip-size")
 
     device = torch.device(str(args.device))
-    from jasna.accelerator import device_context, is_amd_device
+    from jasna.accelerator import device_context, is_nvidia_device, vendor_for_device
 
     fp16 = bool(args.fp16)
     detection_score_threshold = float(args.detection_score_threshold)
@@ -630,9 +630,12 @@ def main() -> None:
     from jasna.restorer.restoration_pipeline import RestorationPipeline
 
     secondary_name = str(args.secondary_restoration).lower()
-    if is_amd_device(device) and secondary_name != "none":
+    # Secondary restorers (unet-4x/TensorRT, rtx-super-res/nvidia-vfx, tvai) are
+    # NVIDIA-only for now; AMD and Intel builds have no equivalent.
+    if not is_nvidia_device(device) and secondary_name != "none":
         raise ValueError(
-            f"Secondary restoration '{secondary_name}' is not available in the AMD build yet"
+            f"Secondary restoration '{secondary_name}' is not available on the "
+            f"{vendor_for_device(device).value} build yet"
         )
 
     if args.license_email and args.license_key:
@@ -642,7 +645,7 @@ def main() -> None:
     compile_result = ensure_engines_compiled(EngineCompilationRequest(
         device=str(device),
         fp16=fp16,
-        basicvsrpp=bool(args.compile_basicvsrpp) and not is_amd_device(device),
+        basicvsrpp=bool(args.compile_basicvsrpp) and is_nvidia_device(device),
         basicvsrpp_model_path=str(restoration_model_path),
         basicvsrpp_max_clip_size=max_clip_size,
         detection=True,

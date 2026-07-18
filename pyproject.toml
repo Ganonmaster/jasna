@@ -45,6 +45,12 @@ amd = [
   "onnxruntime-migraphx==1.23.2",
   "numpy==1.26.4",
 ]
+intel = [
+  "torch==2.12.0+xpu",
+  "torchvision==0.27.0+xpu",
+  "pytorch-triton-xpu",
+  "openvino>=2026.2",
+]
 dev = [
   "nuitka>=2.4",
   "pytest",
@@ -60,6 +66,11 @@ include-package-data = false
 [tool.setuptools.packages.find]
 include = ["jasna*"]
 exclude = ["jasna.protection.keytool*", "jasna.protection.tests*"]
+
+# Ship the precompiled CUDA YUV->RGB kernel in wheels — non-editable installs
+# were missing it (NVIDIA-facing; found via the Intel work).
+[tool.setuptools.package-data]
+"jasna.media" = ["*.fatbin"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

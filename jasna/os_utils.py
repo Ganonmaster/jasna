@@ -51,9 +51,13 @@ def check_supported_gpu(
         from jasna._suppress_noise import install as _install_noise_filters
         _install_noise_filters()
         import torch
-        from jasna.accelerator import AcceleratorVendor, vendor_for_device
+        from jasna.accelerator import AcceleratorVendor, probe_xpu_subprocess, vendor_for_device
     except ImportError:
         return False, "no_cuda"
+    # Intel is a genuine xpu device, so it satisfies no torch.cuda gate — check
+    # it BEFORE the no_cuda gate, via the crash-safe subprocess probe.
+    if vendor_for_device(device) is AcceleratorVendor.INTEL:
+        return probe_xpu_subprocess()
     if not torch.cuda.is_available():
         return False, "no_cuda"
     if vendor_for_device(device) is AcceleratorVendor.AMD:
@@ -335,6 +339,11 @@ def check_gpu_driver_version() -> tuple[bool, str]:
             if not torch.cuda.is_available():
                 return False, f"ROCm {hip_version} is installed but no AMD GPU is available"
             return True, f"ROCm {hip_version}"
+        # Intel xpu builds have no NVIDIA driver to query; check_supported_gpu's
+        # xpu probe already validated the runtime.
+        xpu_version = getattr(torch.version, "xpu", None)
+        if xpu_version:
+            return True, f"Intel XPU runtime {xpu_version}"
     except ImportError:
         pass
 

@@ -98,7 +98,12 @@ def install() -> None:
     # logger at import time (triggered by torch_tensorrt). It bypasses the
     # logging/warnings machinery, so the only way to mute it is to filter the
     # message in trt.Logger.log before the module is imported.
-    import tensorrt as trt
+    try:
+        import tensorrt as trt
+    except ImportError:
+        # AMD (MIGraphX) and Intel (OpenVINO) builds ship no TensorRT — there
+        # is no TRT logger noise to mute.
+        return
 
     _original_trt_log = trt.Logger.log
 
