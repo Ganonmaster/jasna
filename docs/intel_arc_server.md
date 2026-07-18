@@ -46,8 +46,12 @@ EOF
 
 ```bash
 uv venv --python 3.13 .venv && source .venv/bin/activate
-uv pip install ".[intel]" --extra-index-url https://download.pytorch.org/whl/xpu
+uv pip install -e ".[intel]" --extra-index-url https://download.pytorch.org/whl/xpu
 ```
+
+`-e` (editable) is recommended for a git-checkout deployment: `git pull` takes
+effect without reinstalling (re-run the install only when dependencies change).
+A regular `uv pip install ".[intel]" …` works too.
 
 Unlike the Nvidia dev setup, do **not** pass `--no-build-isolation` here: a fresh
 Python 3.13 venv has no `setuptools`, so the build fails with

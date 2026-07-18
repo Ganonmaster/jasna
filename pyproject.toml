@@ -82,8 +82,15 @@ name = "pytorch-xpu"
 url = "https://download.pytorch.org/whl/xpu"
 explicit = true
 
-[tool.setuptools]
-packages = ["jasna", "jasna.gui", "jasna.mosaic", "jasna.ov", "jasna.restorer", "jasna.trt"]
+# Auto-discover all subpackages (namespace-aware: jasna.models has no
+# __init__.py). The old hand-maintained list silently omitted jasna.media,
+# jasna.models, jasna.tracking, jasna.benchmark and jasna.packaging, which
+# broke every non-editable install with ModuleNotFoundError.
+[tool.setuptools.packages.find]
+include = ["jasna", "jasna.*"]
+
+[tool.setuptools.package-data]
+"jasna.media" = ["*.fatbin"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
