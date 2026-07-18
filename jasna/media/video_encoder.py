@@ -20,6 +20,7 @@ from jasna.accelerator import (
     AcceleratorVendor,
     current_stream,
     device_name,
+    host_buffer,
     new_event,
     new_stream,
     set_device,
@@ -28,8 +29,10 @@ from jasna.accelerator import (
 )
 from jasna.media import (
     AMF_SUPPORTED_ENCODER_SETTINGS_BY_CODEC,
+    QSV_SUPPORTED_ENCODER_SETTINGS_BY_CODEC,
     SUPPORTED_ENCODER_SETTINGS_BY_CODEC,
     VideoMetadata,
+    codec_open_lock,
     validate_encoder_settings,
 )
 from jasna.media.audio_utils import needs_audio_reencode
@@ -222,6 +225,45 @@ AMF_ENCODER_SPECS: dict[str, EncoderSpec] = {
     ),
 }
 
+# Intel QSV specs. ICQ rate control via global_quality; first-cut placeholder
+# quality settings (VMAF-tune against the NVENC defaults later).
+DEFAULT_QSV_HEVC_ENCODER_OPTIONS: dict[str, str] = {
+    "preset": "slow", "global_quality": "22", "profile": "main10", "g": "250", "bf": "4",
+}
+DEFAULT_QSV_H264_ENCODER_OPTIONS: dict[str, str] = {
+    "preset": "slow", "global_quality": "23", "g": "250", "bf": "4",
+}
+DEFAULT_QSV_AV1_ENCODER_OPTIONS: dict[str, str] = {
+    "preset": "slow", "global_quality": "30", "g": "250",
+}
+
+QSV_ENCODER_SPECS: dict[str, EncoderSpec] = {
+    "hevc": EncoderSpec(
+        name="hevc",
+        encoder_name="hevc_qsv",
+        frame_format="p010le",
+        default_options=MappingProxyType(DEFAULT_QSV_HEVC_ENCODER_OPTIONS),
+        ten_bit=True,
+        supported_settings=QSV_SUPPORTED_ENCODER_SETTINGS_BY_CODEC["hevc"],
+    ),
+    "h264": EncoderSpec(
+        name="h264",
+        encoder_name="h264_qsv",
+        frame_format="nv12",
+        default_options=MappingProxyType(DEFAULT_QSV_H264_ENCODER_OPTIONS),
+        ten_bit=False,
+        supported_settings=QSV_SUPPORTED_ENCODER_SETTINGS_BY_CODEC["h264"],
+    ),
+    "av1": EncoderSpec(
+        name="av1",
+        encoder_name="av1_qsv",
+        frame_format="p010le",
+        default_options=MappingProxyType(DEFAULT_QSV_AV1_ENCODER_OPTIONS),
+        ten_bit=True,
+        supported_settings=QSV_SUPPORTED_ENCODER_SETTINGS_BY_CODEC["av1"],
+    ),
+}
+
 _CODEC_MAP = {spec.name: spec.encoder_name for spec in ENCODER_SPECS.values()}
 
 # ITU-T H.273 matrix, primaries, and transfer-characteristic code points.
@@ -308,15 +350,20 @@ class NvidiaVideoEncoder:
     ):
         self.device = torch.device(device)
         self.vendor = vendor_for_device(self.device)
-        if self.vendor not in {AcceleratorVendor.NVIDIA, AcceleratorVendor.AMD}:
+        if self.vendor not in {
+            AcceleratorVendor.NVIDIA,
+            AcceleratorVendor.AMD,
+            AcceleratorVendor.INTEL,
+        }:
             raise RuntimeError(
                 f"GPU video encoding is not supported on {self.vendor.value}"
             )
-        specs = (
-            AMF_ENCODER_SPECS
-            if self.vendor is AcceleratorVendor.AMD
-            else ENCODER_SPECS
-        )
+        if self.vendor is AcceleratorVendor.AMD:
+            specs = AMF_ENCODER_SPECS
+        elif self.vendor is AcceleratorVendor.INTEL:
+            specs = QSV_ENCODER_SPECS
+        else:
+            specs = ENCODER_SPECS
         if codec not in specs:
             raise ValueError(f"Unsupported codec: {codec}")
         spec = specs[codec]
@@ -342,7 +389,7 @@ class NvidiaVideoEncoder:
                 codec=codec,
                 vendor=self.vendor,
             )
-        if smart_fragment and self.vendor is AcceleratorVendor.AMD:
+        if smart_fragment and self.vendor is not AcceleratorVendor.NVIDIA:
             raise ValueError("Smart rendering is currently supported only with NVENC")
 
         self.metadata = metadata
@@ -414,17 +461,29 @@ class NvidiaVideoEncoder:
                 allow_software_fallback=False,
                 is_hw_owned=False,
             )
-        out_v = self.dst.add_stream(self.encoder_name, **stream_kwargs)
+        elif self.vendor is AcceleratorVendor.INTEL:
+            stream_kwargs["hwaccel"] = HWAccel(
+                "qsv",
+                device=str(self.device.index or 0),
+                allow_software_fallback=False,
+                is_hw_owned=False,
+            )
+        # Serialize codec init against the pipeline's decoder opens (see
+        # codec_open_lock) — concurrent hardware avcodec_open2 deadlocks.
+        with codec_open_lock:
+            out_v = self.dst.add_stream(self.encoder_name, **stream_kwargs)
         out_v.width = self.metadata.video_width
         out_v.height = self.metadata.video_height
         out_v.time_base = self.metadata.time_base
         ctx = out_v.codec_context
         ctx.time_base = self.metadata.time_base
         ctx.framerate = self.output_fps
+        # NVENC needs the "cuda" hardware format; AMF/QSV consume the packed
+        # host frame in its native layout (nv12/p010le).
         ctx.pix_fmt = (
-            self.spec.frame_format
-            if self.vendor is AcceleratorVendor.AMD
-            else "cuda"
+            "cuda"
+            if self.vendor is AcceleratorVendor.NVIDIA
+            else self.spec.frame_format
         )
         if self.smart_fragment:
             from av.codec.context import Flags
@@ -459,16 +518,17 @@ class NvidiaVideoEncoder:
             )
         self.stream = new_stream(self.device)
         self._host_yuv = None
-        if self.vendor is AcceleratorVendor.AMD:
+        if self.vendor is not AcceleratorVendor.NVIDIA:
+            # AMF/QSV consume a system-memory frame; reuse one pinned host buffer.
             dtype = torch.uint16 if self.spec.ten_bit else torch.uint8
-            self._host_yuv = torch.empty(
+            self._host_yuv = host_buffer(
                 (
                     self.metadata.video_height
                     + self.metadata.video_height // 2,
                     self.metadata.video_width,
                 ),
-                dtype=dtype,
-                pin_memory=True,
+                dtype,
+                want_pinned=True,
             )
         self.pts_heap: list[int] = []
         self.frame_buffer: deque = deque()
@@ -670,7 +730,10 @@ class NvidiaVideoEncoder:
             f"'{self.output_path.suffix}' output on {gpu}: {exc}"
         )
         if self.codec == "av1":
-            backend = "AMF" if self.vendor is AcceleratorVendor.AMD else "NVENC"
+            backend = {
+                AcceleratorVendor.AMD: "AMF",
+                AcceleratorVendor.INTEL: "QSV",
+            }.get(self.vendor, "NVENC")
             message += (
                 f". AV1 {backend} encoding requires a GPU/driver generation "
                 "that provides it."
@@ -692,7 +755,8 @@ class NvidiaVideoEncoder:
 
         height = self.metadata.video_height
         self.stream.synchronize()
-        if self.vendor is AcceleratorVendor.AMD:
+        if self.vendor is not AcceleratorVendor.NVIDIA:
+            # AMF/QSV: build the frame from the staged system-memory buffer.
             planes = [self._host_yuv[:height], self._host_yuv[height:]]
             hw_frame = av.VideoFrame.from_dlpack(
                 planes,

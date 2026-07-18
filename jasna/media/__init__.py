@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import threading
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import TYPE_CHECKING
@@ -14,6 +15,15 @@ if TYPE_CHECKING:
     from av.video.reformatter import Colorspace as AvColorspace, ColorRange as AvColorRange
 
 logger = logging.getLogger(__name__)
+
+# avcodec_open2 is not safe to call concurrently for hardware codecs: two
+# threads opening QSV/oneVPL contexts at once deadlock on ffmpeg's codec-init
+# mutex, made worse by PyAV's av_log -> Python logging callback firing inside
+# the open. The pipeline opens a decoder in the decode-detect thread and a
+# second one in the blend-encode thread simultaneously, so every codec-context
+# open in the media layer is serialized through this lock. Opens are one-time
+# per reader/encoder, so there is no steady-state cost. (Benefits AMF too.)
+codec_open_lock = threading.RLock()
 
 # ffmpeg *_nvenc option names shared by every codec
 _COMMON_ENCODER_SETTINGS: frozenset[str] = frozenset(
@@ -86,6 +96,21 @@ AMF_SUPPORTED_ENCODER_SETTINGS: frozenset[str] = frozenset().union(
     *AMF_SUPPORTED_ENCODER_SETTINGS_BY_CODEC.values()
 )
 
+# Intel QSV (*_qsv) option names.
+_COMMON_QSV_ENCODER_SETTINGS: frozenset[str] = frozenset(
+    {"preset", "profile", "g", "bf", "maxrate", "bufsize", "global_quality", "async_depth", "low_power"}
+)
+
+QSV_SUPPORTED_ENCODER_SETTINGS_BY_CODEC: dict[str, frozenset[str]] = {
+    "hevc": _COMMON_QSV_ENCODER_SETTINGS | {"tier"},
+    "h264": _COMMON_QSV_ENCODER_SETTINGS | {"look_ahead"},
+    "av1": _COMMON_QSV_ENCODER_SETTINGS | {"tile_rows", "tile_cols"},
+}
+
+QSV_SUPPORTED_ENCODER_SETTINGS: frozenset[str] = frozenset().union(
+    *QSV_SUPPORTED_ENCODER_SETTINGS_BY_CODEC.values()
+)
+
 
 def _parse_encoder_setting_scalar(value: str) -> object:
     v = value.strip()
@@ -142,16 +167,15 @@ def validate_encoder_settings(
         if vendor is None
         else AcceleratorVendor(str(vendor))
     )
-    by_codec = (
-        AMF_SUPPORTED_ENCODER_SETTINGS_BY_CODEC
-        if resolved_vendor is AcceleratorVendor.AMD
-        else SUPPORTED_ENCODER_SETTINGS_BY_CODEC
-    )
-    supported_all = (
-        AMF_SUPPORTED_ENCODER_SETTINGS
-        if resolved_vendor is AcceleratorVendor.AMD
-        else SUPPORTED_ENCODER_SETTINGS
-    )
+    if resolved_vendor is AcceleratorVendor.AMD:
+        by_codec = AMF_SUPPORTED_ENCODER_SETTINGS_BY_CODEC
+        supported_all = AMF_SUPPORTED_ENCODER_SETTINGS
+    elif resolved_vendor is AcceleratorVendor.INTEL:
+        by_codec = QSV_SUPPORTED_ENCODER_SETTINGS_BY_CODEC
+        supported_all = QSV_SUPPORTED_ENCODER_SETTINGS
+    else:
+        by_codec = SUPPORTED_ENCODER_SETTINGS_BY_CODEC
+        supported_all = SUPPORTED_ENCODER_SETTINGS
     if "spatial_aq" in settings and "spatial-aq" in settings:
         raise ValueError(
             "Conflicting encoder settings: spatial_aq and spatial-aq are aliases; use only one"

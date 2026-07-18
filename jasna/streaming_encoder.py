@@ -135,6 +135,16 @@ class StreamingEncoder:
                 '-g', str(self._gop_size),
                 '-pix_fmt', 'yuv420p',
             ]
+        elif self._vendor is AcceleratorVendor.INTEL:
+            cmd += [
+                '-c:v', 'h264_qsv',
+                '-preset', 'medium',
+                '-global_quality', '21',
+                '-bf', '0',
+                '-profile:v', 'high',
+                '-g', str(self._gop_size),
+                '-pix_fmt', 'nv12',
+            ]
         else:
             cmd += [
                 '-c:v', 'h264_nvenc',

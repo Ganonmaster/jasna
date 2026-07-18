@@ -4,9 +4,39 @@ import re
 import shutil
 import subprocess
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 from jasna._frozen import is_frozen
+
+
+@lru_cache(maxsize=4)
+def check_qsv_available(encoder: str = "h264_qsv") -> tuple[bool, str]:
+    """Whether PyAV can actually open a QSV encoder session.
+
+    torch.xpu being usable says nothing about the media stack; opening an
+    encoder context is the only reliable probe (it initializes the oneVPL
+    session, failing cleanly when the runtime or ffmpeg build lacks QSV).
+    """
+    try:
+        import av
+    except ImportError as e:
+        return False, f"PyAV not available: {e}"
+    if encoder not in av.codecs_available:
+        return False, f"{encoder} not in PyAV codecs (FFmpeg built without libvpl?)"
+    try:
+        from fractions import Fraction
+
+        ctx = av.Codec(encoder, "w").create()
+        ctx.width = 256
+        ctx.height = 256
+        ctx.pix_fmt = "nv12"
+        ctx.time_base = Fraction(1, 30)
+        ctx.framerate = Fraction(30, 1)
+        ctx.open()
+    except Exception as e:
+        return False, f"{encoder} failed to open: {e}"
+    return True, encoder
 
 logger = logging.getLogger(__name__)
 

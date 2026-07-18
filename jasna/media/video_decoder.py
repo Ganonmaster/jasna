@@ -15,7 +15,7 @@ from jasna.accelerator import (
     stream_context,
     vendor_for_device,
 )
-from jasna.media import VideoMetadata, resolve_video_start_pts
+from jasna.media import VideoMetadata, codec_open_lock, resolve_video_start_pts
 from jasna.media.yuv_to_rgb import YuvToRgbConverter
 
 log = logging.getLogger(__name__)
@@ -75,32 +75,37 @@ class NvidiaVideoReader:
         self._decoder_ctx = None
         self._amd_hardware_decode = False
         current_stream(self.device)
-        try:
-            if self.vendor is AcceleratorVendor.NVIDIA:
-                hwaccel = HWAccel(
-                    "cuda",
-                    device=str(self.device.index or 0),
-                    allow_software_fallback=True,
-                    is_hw_owned=True,
-                )
-                # Reuse torch's current primary context without changing its
-                # scheduling flags.
-                hwaccel.options["primary_ctx"] = "0"
-                hwaccel.options["current_ctx"] = "1"
-                self.container = av.open(self.file, hwaccel=hwaccel)
-            else:
-                self.container = av.open(self.file)
-            self.video_stream = self.container.streams.video[0]
-        except av.FFmpegError as e:
-            raise VideoDecodeError(f"Failed to open {self.file}: {e}") from e
+        # Serialize hardware codec init across pipeline threads (see codec_open_lock):
+        # concurrent QSV/oneVPL avcodec_open2 deadlocks.
+        with codec_open_lock:
+            try:
+                if self.vendor is AcceleratorVendor.NVIDIA:
+                    hwaccel = HWAccel(
+                        "cuda",
+                        device=str(self.device.index or 0),
+                        allow_software_fallback=True,
+                        is_hw_owned=True,
+                    )
+                    # Reuse torch's current primary context without changing its
+                    # scheduling flags.
+                    hwaccel.options["primary_ctx"] = "0"
+                    hwaccel.options["current_ctx"] = "1"
+                    self.container = av.open(self.file, hwaccel=hwaccel)
+                else:
+                    self.container = av.open(self.file)
+                self.video_stream = self.container.streams.video[0]
+            except av.FFmpegError as e:
+                raise VideoDecodeError(f"Failed to open {self.file}: {e}") from e
 
-        ctx = self.video_stream.codec_context
-        if self.vendor is AcceleratorVendor.AMD:
-            self._setup_amf_decoder(ctx)
-        elif not ctx.is_hwaccel:
-            # Definite software decode: let FFmpeg pick frame/slice threading.
-            # CUDA contexts must keep their default threading configuration.
-            ctx.thread_type = "AUTO"
+            ctx = self.video_stream.codec_context
+            if self.vendor is AcceleratorVendor.AMD:
+                self._setup_amf_decoder(ctx)
+            elif self.vendor is AcceleratorVendor.INTEL:
+                self._setup_qsv_decoder(ctx)
+            elif not ctx.is_hwaccel:
+                # Definite software decode: let FFmpeg pick frame/slice threading.
+                # CUDA contexts must keep their default threading configuration.
+                ctx.thread_type = "AUTO"
         self.width = ctx.width
         self.height = ctx.height
         self._full_range = (
@@ -146,6 +151,39 @@ class NvidiaVideoReader:
             log.warning(
                 "AMF cannot decode %s (codec %s): %s; using FFmpeg software "
                 "decoding and uploading frames to ROCm",
+                self.file,
+                self.metadata.codec_name,
+                exc,
+            )
+
+    def _setup_qsv_decoder(self, source_ctx) -> None:
+        from jasna.media.qsv import qsv_decoder_available, qsv_decoder_name
+
+        decoder_name = qsv_decoder_name(str(source_ctx.name))
+        if decoder_name is None or not qsv_decoder_available(self.metadata.codec_name):
+            source_ctx.thread_type = "AUTO"
+            return
+        try:
+            # Copy-back mode: the *_qsv decoder + gpu_copy=on decodes on the GPU
+            # and hands back system-memory NV12/P010 frames (no HWAccel object),
+            # which _frames_software then reformats and uploads to xpu.
+            decoder = av.CodecContext.create(decoder_name, "r")
+            decoder.options = {"gpu_copy": "on"}
+            if source_ctx.extradata:
+                decoder.extradata = source_ctx.extradata
+            decoder.width = source_ctx.width
+            decoder.height = source_ctx.height
+            decoder.time_base = source_ctx.time_base
+            decoder.framerate = source_ctx.framerate
+            decoder.sample_aspect_ratio = source_ctx.sample_aspect_ratio
+            decoder.open(strict=False)
+            self._decoder_ctx = decoder
+            log.info("Using QSV hardware decoder %s for %s", decoder_name, self.file)
+        except (ValueError, av.FFmpegError, RuntimeError) as exc:
+            source_ctx.thread_type = "AUTO"
+            log.warning(
+                "QSV cannot decode %s (codec %s): %s; using FFmpeg software "
+                "decoding and uploading frames to xpu",
                 self.file,
                 self.metadata.codec_name,
                 exc,
