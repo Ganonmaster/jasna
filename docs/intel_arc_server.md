@@ -45,8 +45,14 @@ EOF
 
 ```bash
 uv venv --python 3.13 .venv && source .venv/bin/activate
-uv pip install ".[intel]" --no-build-isolation --extra-index-url https://download.pytorch.org/whl/xpu
+uv pip install ".[intel]" --extra-index-url https://download.pytorch.org/whl/xpu
 ```
+
+Unlike the Nvidia dev setup, do **not** pass `--no-build-isolation` here: a fresh
+Python 3.13 venv has no `setuptools`, so the build fails with
+`ModuleNotFoundError: No module named 'setuptools'`. There is nothing to compile
+natively on the Intel path, so standard build isolation is correct. (If you do
+need the flag, run `uv pip install setuptools wheel` first.)
 
 This installs `torch`/`torchvision` **+xpu** wheels, `pytorch-triton-xpu`, and
 `openvino` (>= 2026.2, the first release supporting the Arc Pro B50). Do not

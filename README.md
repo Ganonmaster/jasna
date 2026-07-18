@@ -425,8 +425,10 @@ Install runtime dependencies for your GPU vendor (exactly one of the two extras)
 # Nvidia (CUDA):
 uv pip install ".[nvidia]" --no-build-isolation --extra-index-url https://download.pytorch.org/whl/cu130
 
-# Intel Arc (xpu, Linux server; see docs/intel_arc_server.md):
-uv pip install ".[intel]" --no-build-isolation --extra-index-url https://download.pytorch.org/whl/xpu
+# Intel Arc (xpu, Linux server; see docs/intel_arc_server.md).
+# No --no-build-isolation here: fresh venvs lack setuptools and the Intel
+# path builds nothing natively.
+uv pip install ".[intel]" --extra-index-url https://download.pytorch.org/whl/xpu
 ```
 
 For Nvidia library builds, you also need:
