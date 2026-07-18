@@ -30,14 +30,15 @@ vainfo                       # must list H264/HEVC/AV1 decode + encode entrypoin
 sycl-ls 2>/dev/null || true  # if oneAPI basekit present: should list the GPU
 python -c "import torch; print(torch.xpu.is_available(), torch.xpu.get_device_name(0))"
 
-# 10-bit pack sanity: the P010 converter relies on mod-2^16 float->int16 cast
-# semantics (verified on CUDA and x86 CPU; run this once on xpu):
+# 10-bit pack sanity (regression check). XPU's float->int16 conversion
+# saturates rather than wraps, so the P010 packer wraps explicitly; this
+# confirms bright samples survive on this driver/torch combination:
 python - <<'EOF'
 import torch
 from jasna.media.rgb_to_p010 import chw_rgb_to_p010_bt709_limited
 white = torch.full((3, 64, 64), 255, dtype=torch.uint8, device="xpu")
 v = chw_rgb_to_p010_bt709_limited(white)[:64].view(torch.uint16)[0, 0].item()
-print("OK" if v == 60160 else f"FAIL: got {v}, expected 60160 — xpu int16 cast saturates")
+print("OK" if v == 60160 else f"FAIL: got {v}, expected 60160")
 EOF
 ```
 
