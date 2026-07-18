@@ -48,6 +48,20 @@ from jasna.restorer.basicvsrpp_mosaic_restorer import BasicvsrppMosaicRestorer
 from jasna.restorer.restoration_pipeline import RestorationPipeline
 import jasna.engine_compiler
 import jasna.vram_offloader
+
+# Module imports alone don't cover call-time imports (a bare `import
+# tensorrt` inside a function body); exercise the startup-path functions
+# every Intel run goes through.
+from jasna._suppress_noise import install
+install()
+from jasna.device_backend import default_fp16, hw_media, resolve_fp16, supports_tensorrt
+import torch
+assert supports_tensorrt(torch.device("cpu")) is False
+assert hw_media(torch.device("cpu")) is None
+assert resolve_fp16(None, torch.device("cpu")) is False
+from jasna.engine_compiler import EngineCompilationRequest, ensure_engines_compiled
+result = ensure_engines_compiled(EngineCompilationRequest(device="cpu", fp16=False, basicvsrpp=False))
+assert result.use_basicvsrpp_tensorrt is False
 print("INTEL_IMPORT_OK")
 """
 
