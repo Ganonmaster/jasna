@@ -169,14 +169,25 @@ class RfDetrMosaicDetectionModel:
         valid_mask = topk_values > score_threshold  # (B, K)
         boxes_cpu = boxes.to(device='cpu', dtype=torch.float32).numpy()  # (B, K, 4)
         valid_mask_cpu = valid_mask.cpu().numpy()  # (B, K)
-        
+
         boxes_list: list[np.ndarray] = []
         masks_list: list[torch.Tensor] = []
         for i in range(b):
             valid_i = valid_mask_cpu[i]
             boxes_list.append(boxes_cpu[i][valid_i])  # (N_i, 4) CPU
-            masks_list.append(masks[i][valid_mask[i]])  # (N_i, Hm, Wm) GPU
-        
+            # Select masks by integer index derived from the already-synced CPU
+            # mask, not by boolean-indexing the device tensor: the latter runs
+            # nonzero() + a D2H sync on every frame (b syncs/batch), which
+            # stalls the xpu pipeline. index_select with the small precomputed
+            # index needs only a cheap H2D and is bit-identical (nonzero yields
+            # ascending indices, matching boolean-index order).
+            idx = np.nonzero(valid_i)[0]
+            if idx.size:
+                index = torch.as_tensor(idx, dtype=torch.long, device=masks.device)
+                masks_list.append(masks[i].index_select(0, index))
+            else:
+                masks_list.append(masks[i][:0])
+
         return boxes_list, masks_list
 
     def scan_scores_masks(
