@@ -198,6 +198,33 @@ class TestRfDetrInit:
 
         assert model.engine_path == cache_dir
 
+    def test_intel_init_uses_openvino_cache_dir(self, monkeypatch, tmp_path):
+        import jasna.mosaic.rfdetr as module
+        import jasna.ov.ov_runner as ov_runner
+
+        cache_dir = tmp_path / "model.openvino"
+        runner = MagicMock()
+        runner.input_names = ["images"]
+        runner.input_dtypes = {"images": torch.float16}
+        runner.output_names = ["pred_boxes", "pred_logits", "pred_masks"]
+        runner.outputs = {
+            "pred_boxes": MagicMock(ndim=3, shape=(1, 100, 4)),
+            "pred_logits": MagicMock(ndim=3, shape=(1, 100, 1)),
+            "pred_masks": MagicMock(ndim=4, shape=(1, 100, 8, 8)),
+        }
+        monkeypatch.setattr(module, "is_intel_device", lambda _device: True)
+        monkeypatch.setattr(ov_runner, "ov_cache_dir", lambda *a, **k: cache_dir)
+        monkeypatch.setattr(ov_runner, "OvRunner", MagicMock(return_value=runner))
+
+        model = RfDetrMosaicDetectionModel(
+            onnx_path=tmp_path / "model.onnx",
+            batch_size=1,
+            device=torch.device("xpu:0"),
+            fp16=True,
+        )
+
+        assert model.engine_path == cache_dir
+
 
 class TestRfDetrPreprocess:
     def test_output_shape_and_dtype(self):
@@ -254,6 +281,28 @@ class TestCompileRfdetrEngine:
         result = compile_rfdetr_engine(
             tmp_path / "model.onnx",
             torch.device("cpu"),
+            batch_size=4,
+            fp16=True,
+        )
+
+        assert result == cache_dir
+        runner.close.assert_called_once_with()
+
+    def test_intel_returns_openvino_cache_dir_and_closes_runner(
+        self, monkeypatch, tmp_path
+    ):
+        import jasna.mosaic.rfdetr as module
+        import jasna.ov.ov_runner as ov_runner
+
+        cache_dir = tmp_path / "model.openvino"
+        runner = MagicMock()
+        monkeypatch.setattr(module, "is_intel_device", lambda _device: True)
+        monkeypatch.setattr(ov_runner, "ov_cache_dir", lambda *a, **k: cache_dir)
+        monkeypatch.setattr(ov_runner, "OvRunner", MagicMock(return_value=runner))
+
+        result = compile_rfdetr_engine(
+            tmp_path / "model.onnx",
+            torch.device("xpu:0"),
             batch_size=4,
             fp16=True,
         )

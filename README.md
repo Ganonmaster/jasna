@@ -435,7 +435,14 @@ uv pip install ".[nvidia]" --extra-index-url https://download.pytorch.org/whl/cu
 # AMD Linux (inside a ROCm 7.2 environment)
 uv pip install ".[amd]" \
   --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/
+
+# Intel Arc Linux (torch xpu wheels)
+uv pip install ".[intel]" --extra-index-url https://download.pytorch.org/whl/xpu
 ```
+
+Intel Arc is CLI/headless-only (no GUI); pass `--device xpu:0` explicitly. See
+[docs/intel_arc_server.md](docs/intel_arc_server.md) for the full bring-up
+runbook (drivers, QSV/OpenVINO checks, known Battlemage issues).
 
 For Nvidia library builds, you also need:
 
