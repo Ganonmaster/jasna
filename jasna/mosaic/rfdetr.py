@@ -126,6 +126,7 @@ class RfDetrMosaicDetectionModel:
         )
         self.masks_out = next(k for k in self.runner.output_names if self.runner.outputs[k].ndim == 4)
         self.logits_out = next(k for k in self.runner.output_names if k not in {self.boxes_out, self.masks_out})
+        self._pending_target_hw: dict[int, tuple[int, int]] = {}
         logger.info("RF-DETR detection model loaded: %s (batch_size=%d)", loaded_from, self.batch_size)
 
     def close(self) -> None:
@@ -207,9 +208,7 @@ class RfDetrMosaicDetectionModel:
         merged = F.interpolate(merged, size=mask_hw, mode="area") > 0.0
         return scores, merged[:, 0]
 
-    def __call__(self, frames_uint8_bchw: torch.Tensor, *, target_hw: tuple[int, int]) -> Detections:
-        x = self._preprocess(frames_uint8_bchw)
-        outs = self.runner.infer({self._input_name: x})
+    def _detections_from_outputs(self, outs, target_hw: tuple[int, int]) -> Detections:
         boxes_list, masks_list = self._postprocess(
             pred_boxes=outs[self.boxes_out],
             pred_logits=outs[self.logits_out],
@@ -218,8 +217,26 @@ class RfDetrMosaicDetectionModel:
             score_threshold=self.score_threshold,
             max_select=self.max_select,
         )
-        return Detections(
-            boxes_xyxy=boxes_list,
-            masks=masks_list,
-        )
+        return Detections(boxes_xyxy=boxes_list, masks=masks_list)
+
+    def __call__(self, frames_uint8_bchw: torch.Tensor, *, target_hw: tuple[int, int]) -> Detections:
+        x = self._preprocess(frames_uint8_bchw)
+        outs = self.runner.infer({self._input_name: x})
+        return self._detections_from_outputs(outs, target_hw)
+
+    @property
+    def supports_async(self) -> bool:
+        """True only when the runner can double-buffer (OpenVINO path)."""
+        return hasattr(self.runner, "submit")
+
+    def submit(self, frames_uint8_bchw: torch.Tensor, target_hw: tuple[int, int]) -> int:
+        """Preprocess + start async inference; returns a handle for fetch()."""
+        x = self._preprocess(frames_uint8_bchw)
+        handle = self.runner.submit({self._input_name: x})
+        self._pending_target_hw[handle] = target_hw
+        return handle
+
+    def fetch(self, handle: int) -> Detections:
+        outs = self.runner.fetch(handle)
+        return self._detections_from_outputs(outs, self._pending_target_hw[handle])
 

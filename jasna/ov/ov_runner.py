@@ -122,7 +122,12 @@ class OvRunner:
             self.compiled = core.compile_model(ov_model, ov_device, config)
         except Exception as exc:
             raise RuntimeError(f"Failed to compile OpenVINO model {source} for {ov_device}: {exc}") from exc
-        self.request = self.compiled.create_infer_request()
+        # Two infer requests for double-buffered async: batch N+1 can run on the
+        # GPU while batch N-1's result is fetched and post-processed on the CPU.
+        self._requests = [self.compiled.create_infer_request() for _ in range(2)]
+        self.request = self._requests[0]  # sync infer() uses request 0
+        self._feeds: list[dict | None] = [None, None]  # keep numpy alive per slot (share_inputs)
+        self._next_slot = 0
 
         self.input_names = [port.any_name for port in self.compiled.inputs]
         self.output_names = [port.any_name for port in self.compiled.outputs]
@@ -140,18 +145,50 @@ class OvRunner:
 
     def close(self) -> None:
         self.outputs.clear()
+        self._requests = []
         self.request = None
         self.compiled = None
 
-    def infer(self, inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        feed = {
+    @staticmethod
+    def _to_feed(inputs: dict[str, torch.Tensor]) -> dict:
+        return {
             name: tensor.detach().contiguous().cpu().numpy()
             for name, tensor in inputs.items()
         }
-        # share_inputs: the staged numpy arrays are contiguous and outlive the
-        # call, so OpenVINO can wrap them instead of memcpying a second time.
-        results = self.request.infer(feed, share_inputs=True)
+
+    def _store_outputs(self, results) -> dict[str, torch.Tensor]:
         for port, array in results.items():
             # copy_ fuses dtype conversion and host->device in one hop.
             self.outputs[port.any_name].copy_(torch.from_numpy(array))
         return self.outputs
+
+    def infer(self, inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        # share_inputs: the staged numpy arrays are contiguous and outlive the
+        # call, so OpenVINO can wrap them instead of memcpying a second time.
+        results = self.request.infer(self._to_feed(inputs), share_inputs=True)
+        return self._store_outputs(results)
+
+    def submit(self, inputs: dict[str, torch.Tensor]) -> int:
+        """Start an async inference; returns a handle to fetch() later.
+
+        Uses two ping-ponged infer requests, so a submit() may be issued
+        while a prior request is still running (double buffering). The feed
+        numpy is retained per slot because share_inputs wraps it by reference.
+        """
+        slot = self._next_slot
+        self._next_slot ^= 1
+        feed = self._to_feed(inputs)
+        self._feeds[slot] = feed
+        self._requests[slot].start_async(feed, share_inputs=True)
+        return slot
+
+    def fetch(self, handle: int) -> dict[str, torch.Tensor]:
+        """Wait for a submit()ed inference and copy its outputs to device.
+
+        The returned tensors are the shared persistent output buffers, so the
+        caller must consume them (post-process) before the next fetch().
+        """
+        req = self._requests[handle]
+        req.wait()
+        self._feeds[handle] = None
+        return self._store_outputs(req.results)

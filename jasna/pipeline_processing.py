@@ -128,6 +128,41 @@ def process_frame_batch(
     frames_in = pad_batch_with_last(frames_eff, batch_size=int(batch_size))
 
     detections: Detections = detections_fn(frames_in, target_hw=target_hw)
+    return track_detections(
+        detections=detections,
+        frames_eff=frames_eff,
+        pts_list=pts_list,
+        start_frame_idx=start_frame_idx,
+        tracker=tracker,
+        blend_buffer=blend_buffer,
+        crop_buffers=crop_buffers,
+        clip_queue=clip_queue,
+        metadata_queue=metadata_queue,
+        discard_margin=discard_margin,
+        blend_frames=blend_frames,
+        crop_eye_width=crop_eye_width,
+    )
+
+
+def track_detections(
+    *,
+    detections: Detections,
+    frames_eff: torch.Tensor,
+    pts_list: list[int],
+    start_frame_idx: int,
+    tracker: ClipTracker,
+    blend_buffer: BlendBuffer,
+    crop_buffers: dict[int, CropBuffer],
+    clip_queue: Queue[ClipRestoreItem | object],
+    metadata_queue: Queue[FrameMeta | object],
+    discard_margin: int,
+    blend_frames: int = 0,
+    crop_eye_width: int | None = None,
+) -> BatchProcessResult:
+    """Tracking + crop extraction for a batch whose detections are already
+    computed. Split out of process_frame_batch so the detection call can run
+    asynchronously (submitted for the next batch while this one is tracked)."""
+    effective_bs = len(pts_list)
     _, frame_h, frame_w = frames_eff[0].shape
 
     clips_emitted = 0

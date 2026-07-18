@@ -122,6 +122,18 @@ probe fails it logs a warning and falls back to software decode/encode
 5. Streaming uses the **system** ffmpeg (bundled `tools/ffmpeg` in releases) —
    that binary needs QSV support too (`ffmpeg -encoders | grep qsv`).
 
+### Detection throughput (RF-DETR)
+
+RF-DETR runs on the OpenVINO GPU plugin and is the pipeline's pace-setter on
+Intel (restoration has spare capacity behind it). Two things speed it up:
+
+- **Async double-buffered inference** (on by default): batch N+1's detection runs
+  on the GPU while the CPU tracks batch N, so the GPU no longer idles during
+  tracking/crop work. Set `JASNA_ASYNC_DETECT=0` to force the old synchronous
+  path for A/B comparison.
+- **INT8 quantization** (planned): the B50's INT8 throughput (170 TOPS) is ~8× its
+  fp16, so an INT8 RF-DETR is the main lever to push detection past ~30 fps.
+
 ### Performance expectations
 
 The B50 is a 224 GB/s, ~21 TFLOPS-fp16 card; BasicVSR++ is bandwidth-bound.

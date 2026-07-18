@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from queue import Empty, Queue
@@ -15,7 +16,8 @@ from jasna.frame_queue import FrameQueue
 from jasna.media.video_decoder import create_video_reader
 from jasna.pipeline_debug_logging import PipelineDebugMemoryLogger
 from jasna.pipeline_items import ClipRestoreItem, FrameMeta, PrimaryRestoreResult, SecondaryRestoreResult, _SENTINEL
-from jasna.pipeline_processing import process_frame_batch, finalize_processing
+from jasna.pipeline_processing import process_frame_batch, track_detections, finalize_processing
+from jasna.tensor_utils import pad_batch_with_last
 from jasna.pipeline_timing import LoopTimer
 from jasna.progressbar import Progressbar
 from jasna.restorer import RestorationPipeline
@@ -92,8 +94,58 @@ def decode_detect_loop(
                     return True
                 return any(start <= pts < end for start, end in effect_ranges)
 
+            # Async detection pipeline: when the detector supports double-
+            # buffering (RF-DETR on OpenVINO), submit a run's inference and
+            # track the PREVIOUS run while it computes, so the GPU no longer
+            # idles during CPU tracking/crop work. Order is preserved: exactly
+            # one run is ever in flight, and it is drained before any tracker
+            # finalize / unselected run / loop exit. Env override disables it.
+            # `is True` (not just truthy) so a MagicMock detector in tests, whose
+            # attribute access auto-returns a truthy mock, stays on the sync path.
+            use_async_detect = (
+                getattr(detection_model, "supports_async", False) is True
+                and os.environ.get("JASNA_ASYNC_DETECT", "1") != "0"
+            )
+            _pending: dict | None = None
+
+            def _make_submit(selected_frames, run_pts, start_idx) -> dict:
+                frames_eff = selected_frames[: len(run_pts)]
+                frames_in = pad_batch_with_last(frames_eff, batch_size=batch_size)
+                handle = detection_model.submit(frames_in, target_hw)
+                return {
+                    "handle": handle,
+                    "frames_eff": frames_eff,
+                    "pts_list": run_pts,
+                    "start_frame_idx": start_idx,
+                }
+
+            def _track_one(p: dict) -> None:
+                det = detection_model.fetch(p["handle"])
+                track_detections(
+                    detections=det,
+                    frames_eff=p["frames_eff"],
+                    pts_list=p["pts_list"],
+                    start_frame_idx=p["start_frame_idx"],
+                    tracker=tracker,
+                    blend_buffer=blend_buffer,
+                    crop_buffers=crop_buffers,
+                    clip_queue=clip_queue,
+                    metadata_queue=metadata_queue,
+                    discard_margin=discard_margin,
+                    blend_frames=blend_frames,
+                    crop_eye_width=crop_eye_width,
+                )
+
+            def _flush_pending() -> None:
+                nonlocal _pending
+                if _pending is not None:
+                    p = _pending
+                    _pending = None
+                    _track_one(p)
+
             def _finalize_tracker() -> None:
                 nonlocal effect_active
+                _flush_pending()
                 if not effect_active:
                     return
                 fs = frame_shape[0] if frame_shape else target_hw
@@ -162,23 +214,36 @@ def decode_detect_loop(
                                     selected_frames = vr_projector.forward_sbs(
                                         selected_frames
                                     )
-                                res = process_frame_batch(
-                                    frames=selected_frames,
-                                    pts_list=[int(p) for p in pts_list[offset:group_end]],
-                                    start_frame_idx=frame_idx,
-                                    batch_size=batch_size,
-                                    target_hw=target_hw,
-                                    detections_fn=detection_model,
-                                    tracker=tracker,
-                                    blend_buffer=blend_buffer,
-                                    crop_buffers=crop_buffers,
-                                    clip_queue=clip_queue,
-                                    metadata_queue=metadata_queue,
-                                    discard_margin=discard_margin,
-                                    blend_frames=blend_frames,
-                                    crop_eye_width=crop_eye_width,
-                                )
-                                frame_idx = res.next_frame_idx
+                                run_pts = [int(p) for p in pts_list[offset:group_end]]
+                                if use_async_detect:
+                                    # Submit this run's inference, advance the frame
+                                    # counter, then track the previously-submitted run
+                                    # while this one computes on the GPU. Exactly one
+                                    # run is in flight (_pending); frames_eff is a view
+                                    # that keeps its decode batch alive across iterations.
+                                    new_pending = _make_submit(selected_frames, run_pts, frame_idx)
+                                    frame_idx += len(run_pts)
+                                    if _pending is not None:
+                                        _track_one(_pending)
+                                    _pending = new_pending
+                                else:
+                                    res = process_frame_batch(
+                                        frames=selected_frames,
+                                        pts_list=run_pts,
+                                        start_frame_idx=frame_idx,
+                                        batch_size=batch_size,
+                                        target_hw=target_hw,
+                                        detections_fn=detection_model,
+                                        tracker=tracker,
+                                        blend_buffer=blend_buffer,
+                                        crop_buffers=crop_buffers,
+                                        clip_queue=clip_queue,
+                                        metadata_queue=metadata_queue,
+                                        discard_margin=discard_margin,
+                                        blend_frames=blend_frames,
+                                        crop_eye_width=crop_eye_width,
+                                    )
+                                    frame_idx = res.next_frame_idx
                             else:
                                 _finalize_tracker()
                                 for pts in pts_list[offset:group_end]:

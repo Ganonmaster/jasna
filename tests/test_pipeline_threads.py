@@ -147,6 +147,100 @@ class TestDecodeDetectLoop:
         assert [meta.pts for meta in metas] == [60, 61, 62, 63]
         assert [meta.apply_effect for meta in metas] == [False, True, True, False]
 
+    def test_async_detection_matches_sync(self, monkeypatch):
+        """The async double-buffered detection path must produce identical clip
+        and metadata ordering to the synchronous path."""
+        import dataclasses
+
+        from jasna.mosaic.detections import Detections
+
+        class _StubDetector:
+            supports_async = True
+
+            def __init__(self):
+                self._pending: dict[int, Detections] = {}
+                self._next = 0
+
+            def _detect(self, frames, target_hw) -> Detections:
+                n = int(frames.shape[0])
+                h, w = target_hw
+                box = np.array([w * 0.3, h * 0.3, w * 0.7, h * 0.7], dtype=np.float32)
+                mask = torch.ones(1, int(h), int(w), dtype=torch.bool)
+                return Detections(
+                    boxes_xyxy=[box.reshape(1, 4).copy() for _ in range(n)],
+                    masks=[mask.clone() for _ in range(n)],
+                )
+
+            def __call__(self, frames, *, target_hw):
+                return self._detect(frames, target_hw)
+
+            def submit(self, frames, target_hw) -> int:
+                handle = self._next
+                self._next += 1
+                self._pending[handle] = self._detect(frames, target_hw)
+                return handle
+
+            def fetch(self, handle: int) -> Detections:
+                return self._pending.pop(handle)
+
+        meta = dataclasses.replace(_fake_metadata(num_frames=12), video_width=16, video_height=16)
+
+        def _run(async_enabled: bool):
+            monkeypatch.setenv("JASNA_ASYNC_DETECT", "1" if async_enabled else "0")
+            # 3 batches of 4 frames -> a persistent track split by max_clip_size,
+            # with the in-flight run carried across batch boundaries.
+            batches = [
+                (torch.randint(0, 256, (4, 3, 16, 16), dtype=torch.uint8),
+                 [b * 4 + i for i in range(4)])
+                for b in range(3)
+            ]
+            reader = _mock_reader(batches)
+            clip_queue = FrameQueue(max_frames=9999)
+            metadata_queue = Queue(maxsize=9999)
+            with (
+                patch("jasna.pipeline_threads.create_video_reader", return_value=reader),
+                patch("jasna.pipeline_threads.torch.cuda.set_device"),
+                patch("jasna.pipeline_threads.torch.inference_mode",
+                      return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock(return_value=False))),
+            ):
+                decode_detect_loop(
+                    input_video="fake.mkv",
+                    batch_size=4,
+                    device=torch.device("cpu"),
+                    metadata=meta,
+                    detection_model=_StubDetector(),
+                    max_clip_size=4,
+                    temporal_overlap=1,
+                    enable_crossfade=False,
+                    blend_buffer=BlendBuffer(device=torch.device("cpu")),
+                    crop_buffers={},
+                    clip_queue=clip_queue,
+                    metadata_queue=metadata_queue,
+                    error_holder=[],
+                    frame_shape=[],
+                )
+            clips = []
+            while not clip_queue.empty():
+                item = clip_queue.get_nowait()
+                if item is _SENTINEL:
+                    continue
+                clips.append((item.clip.track_id, item.clip.start_frame, item.keep_start, item.keep_end))
+            metas = []
+            while True:
+                item = metadata_queue.get_nowait()
+                if item is _SENTINEL:
+                    break
+                metas.append(item.frame_idx)
+            return clips, metas
+
+        sync_clips, sync_metas = _run(False)
+        async_clips, async_metas = _run(True)
+
+        assert sync_metas == list(range(12))
+        assert async_metas == sync_metas
+        assert async_clips == sync_clips
+        assert len(sync_clips) > 0  # detections actually produced clips
+
     def test_cancel_event_breaks_loop(self):
         cancel = threading.Event()
         frames_t = torch.randint(0, 256, (2, 3, 8, 8), dtype=torch.uint8)
