@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from jasna.accelerator import is_amd_device, is_nvidia_device
+from jasna.accelerator import is_amd_device, is_intel_device, is_nvidia_device
 from jasna.engine_paths import model_weights_dir
 
 @dataclass(frozen=True)
@@ -158,7 +158,7 @@ def precompile_detection_engine(
     device: torch.device,
     fp16: bool,
 ) -> None:
-    if not (is_nvidia_device(device) or is_amd_device(device)):
+    if not (is_nvidia_device(device) or is_amd_device(device) or is_intel_device(device)):
         return
     det_name = coerce_detection_model_name(detection_model_name)
     if is_rfdetr_model(det_name):

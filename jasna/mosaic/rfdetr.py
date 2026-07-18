@@ -9,7 +9,7 @@ import torch
 logger = logging.getLogger(__name__)
 from torch.nn import functional as F
 
-from jasna.accelerator import is_amd_device, is_nvidia_device
+from jasna.accelerator import is_amd_device, is_intel_device, is_nvidia_device
 from jasna.engine_paths import get_onnx_tensorrt_engine_path
 from jasna.mosaic.detections import Detections
 
@@ -36,6 +36,21 @@ def compile_rfdetr_engine(
             fp16=bool(fp16),
         )
         cache_path = runner.cache_dir
+        runner.close()
+        return cache_path
+    if is_intel_device(device):
+        from jasna.ov.ov_runner import OvRunner, ov_cache_dir
+
+        cache_path = ov_cache_dir(onnx_path, device, fp16=bool(fp16))
+        # Constructing the runner compiles the model, populating the OV blob cache.
+        runner = OvRunner(
+            onnx_path,
+            input_shapes=[(int(batch_size), 3, 768, 768)],
+            device=device,
+            ov_device="GPU",
+            cache_dir=cache_path,
+            fp16=bool(fp16),
+        )
         runner.close()
         return cache_path
     if not is_nvidia_device(device):
@@ -88,6 +103,19 @@ class RfDetrMosaicDetectionModel:
                 fp16=bool(fp16),
             )
             self.engine_path = self.runner.cache_dir
+        elif is_intel_device(self.device):
+            from jasna.ov.ov_runner import OvRunner, ov_cache_dir
+
+            cache_dir = ov_cache_dir(self.onnx_path, self.device, fp16=bool(fp16))
+            self.runner = OvRunner(
+                self.onnx_path,
+                input_shapes=[(self.batch_size, 3, self.resolution, self.resolution)],
+                device=self.device,
+                ov_device="GPU",
+                cache_dir=cache_dir,
+                fp16=bool(fp16),
+            )
+            self.engine_path = cache_dir
         elif is_nvidia_device(self.device):
             self.engine_path = get_onnx_tensorrt_engine_path(
                 self.onnx_path, batch_size=self.batch_size, fp16=bool(fp16),
@@ -159,14 +187,23 @@ class RfDetrMosaicDetectionModel:
         valid_mask = topk_values > score_threshold  # (B, K)
         boxes_cpu = boxes.to(device='cpu', dtype=torch.float32).numpy()  # (B, K, 4)
         valid_mask_cpu = valid_mask.cpu().numpy()  # (B, K)
-        
+
         boxes_list: list[np.ndarray] = []
         masks_list: list[torch.Tensor] = []
         for i in range(b):
             valid_i = valid_mask_cpu[i]
             boxes_list.append(boxes_cpu[i][valid_i])  # (N_i, 4) CPU
-            masks_list.append(masks[i][valid_mask[i]])  # (N_i, Hm, Wm) GPU
-        
+            # Select masks by integer index from the already-synced CPU mask,
+            # not by boolean-indexing the device tensor (which runs nonzero() +
+            # a D2H sync every frame — stalls the xpu/rocm pipeline). Bit-
+            # identical: nonzero yields ascending indices == boolean-index order.
+            idx = np.nonzero(valid_i)[0]
+            if idx.size:
+                index = torch.as_tensor(idx, dtype=torch.long, device=masks.device)
+                masks_list.append(masks[i].index_select(0, index))
+            else:
+                masks_list.append(masks[i][:0])
+
         return boxes_list, masks_list
 
     def scan_scores_masks(

@@ -60,7 +60,7 @@ def _detection_engine_exists(
 ) -> bool:
     import torch
 
-    from jasna.accelerator import is_amd_device
+    from jasna.accelerator import is_amd_device, is_intel_device
     from jasna.mosaic.detection_registry import is_rfdetr_model, is_yolo_model
 
     resolved_device = torch.device(device)
@@ -74,6 +74,17 @@ def _detection_engine_exists(
                 fp16=fp16,
             )
         # YOLO runs through PyTorch on AMD and has no compiled engine artifact.
+        return True
+    if is_intel_device(resolved_device):
+        if is_rfdetr_model(detection_model_name):
+            from jasna.ov.ov_runner import ov_cache_is_ready
+
+            return ov_cache_is_ready(
+                Path(detection_model_path),
+                resolved_device,
+                fp16=fp16,
+            )
+        # YOLO runs through PyTorch on Intel and has no compiled engine artifact.
         return True
 
     from jasna.engine_paths import (
@@ -116,12 +127,13 @@ def ensure_engines_compiled(
 ) -> EngineCompilationResult:
     import torch
 
-    from jasna.accelerator import is_amd_device, is_nvidia_device
+    from jasna.accelerator import is_amd_device, is_intel_device, is_nvidia_device
 
     result = EngineCompilationResult()
     device = torch.device(req.device)
     nvidia = is_nvidia_device(device)
     amd = is_amd_device(device)
+    intel = is_intel_device(device)
 
     if req.unet4x and not nvidia:
         raise RuntimeError("unet-4x currently requires the NVIDIA TensorRT build")
@@ -154,11 +166,12 @@ def ensure_engines_compiled(
         return result
 
     logger.info("Spawning GPU model compilation subprocess...")
-    start_msg = (
-        "Preparing MIGraphX model cache (this may take several minutes)..."
-        if amd
-        else "Compiling TensorRT engines (this may take several minutes)..."
-    )
+    if amd:
+        start_msg = "Preparing MIGraphX model cache (this may take several minutes)..."
+    elif intel:
+        start_msg = "Preparing OpenVINO model cache (this may take several minutes)..."
+    else:
+        start_msg = "Compiling TensorRT engines (this may take several minutes)..."
     # The frozen GUI drops its console (FreeConsole), leaving stdout invalid — an
     # unconditional print() there raises WinError 6. Print only on the CLI (no callback).
     if log_callback:
