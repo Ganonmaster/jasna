@@ -62,6 +62,18 @@ def _get_coeffs(
     return mat, off
 
 
+def _to_p010_int16(plane: torch.Tensor) -> torch.Tensor:
+    """Float P010 sample values (code << 6, up to 65472) -> int16 bit patterns.
+
+    The tensor is int16 only as a storage type; consumers reinterpret it as
+    uint16. The two's-complement wrap must be explicit: a direct out-of-range
+    float->int16 cast happens to wrap on CUDA and x86 but SATURATES to 32767
+    on XPU (SYCL conversion rules), which would collapse every bright pixel
+    to mid-gray in 10-bit output.
+    """
+    return torch.where(plane >= 32768.0, plane - 65536.0, plane).to(torch.int16)
+
+
 def _chw_rgb_to_p010(
     img_chw: torch.Tensor,
     name: str,
@@ -88,13 +100,12 @@ def _chw_rgb_to_p010(
     # Clamp to the selected 10-bit code range, then store P010 values << 6.
     y_min, y_max = (0, 1023) if full_range else (64, 940)
     uv_min, uv_max = (0, 1023) if full_range else (64, 960)
-    Y = yuv[0].round_().clamp_(y_min, y_max).mul_(64).to(torch.int16)
+    Y = _to_p010_int16(yuv[0].round_().clamp_(y_min, y_max).mul_(64))
 
     # UV planes: subsample 4:2:0 via avg_pool2d on both channels at once
     uv_full = yuv[1:3].unsqueeze(0)  # (1, 2, H, W)
     uv_ds = F.avg_pool2d(uv_full, 2).squeeze(0)  # (2, H/2, W/2)
-    uv_ds.round_().clamp_(uv_min, uv_max).mul_(64)
-    uv_i16 = uv_ds.to(torch.int16)
+    uv_i16 = _to_p010_int16(uv_ds.round_().clamp_(uv_min, uv_max).mul_(64))
 
     # Interleave U and V: (H/2, W) with alternating U, V
     uv_interleaved = uv_i16.permute(1, 2, 0).reshape(H // 2, W)
