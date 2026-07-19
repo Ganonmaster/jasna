@@ -7,6 +7,8 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+from jasna.accelerator import synchronize
+
 from jasna.restorer.basicvrspp_tenorrt_compilation import basicvsrpp_startup_policy
 from jasna.restorer.basicvsrpp_mosaic_restorer import BasicvsrppMosaicRestorer
 from jasna.restorer.basicvsrpp_sub_engines import BasicVSRPlusPlusNetSplit
@@ -18,10 +20,10 @@ RUNS = 100
 
 
 def _timed(label: str, fn, *args, **kwargs):
-    torch.cuda.synchronize()
+    synchronize()
     t0 = time.perf_counter()
     result = fn(*args, **kwargs)
-    torch.cuda.synchronize()
+    synchronize()
     dt = time.perf_counter() - t0
     print(f"  {label:30s} {dt*1000:8.1f} ms")
     return result
@@ -33,7 +35,7 @@ def _profile_split_forward(split: BasicVSRPlusPlusNetSplit, device: torch.device
 
     for _ in range(WARMUP):
         split(lqs)
-    torch.cuda.synchronize()
+    synchronize()
 
     print(f"\n=== Profiling BasicVSRPlusPlusNetSplit (T={T}) ===")
     n, t, c, h, w = lqs.size()
@@ -72,7 +74,7 @@ def _profile_split_forward(split: BasicVSRPlusPlusNetSplit, device: torch.device
                 frame_idx = frame_idx[::-1]
                 flow_idx = frame_idx
 
-            torch.cuda.synchronize()
+            synchronize()
             tp0 = time.perf_counter()
             acc_flows = split._precompute_accumulated_flows(
                 flows, flow_idx, len(frame_idx), grid,
@@ -92,7 +94,7 @@ def _profile_split_forward(split: BasicVSRPlusPlusNetSplit, device: torch.device
                 acc_nhwc[..., 1].mul_(scale_y)
                 acc_nhwc.add_(grid)
                 acc_grids = {k: acc_nhwc[j : j + 1] for j, k in enumerate(acc_keys)}
-            torch.cuda.synchronize()
+            synchronize()
             total_precompute += time.perf_counter() - tp0
 
             lbe = split._loop_body_engines[module_name]
@@ -123,10 +125,10 @@ def _profile_split_forward(split: BasicVSRPlusPlusNetSplit, device: torch.device
                         flow_n2 = zero_flow
                         g_n2 = grid
 
-                    torch.cuda.synchronize()
+                    synchronize()
                     tlb0 = time.perf_counter()
                     feat_prop = lbe(feat_prop, g_n1, feat_n2, g_n2, feat_current, flow_n1, flow_n2, backbone_prefix)
-                    torch.cuda.synchronize()
+                    synchronize()
                     total_loop_body += time.perf_counter() - tlb0
                 else:
                     feat = torch.cat([backbone_prefix, feat_prop], dim=1)
@@ -143,10 +145,10 @@ def _profile_split_forward(split: BasicVSRPlusPlusNetSplit, device: torch.device
 
     durations: list[float] = []
     for _ in range(RUNS):
-        torch.cuda.synchronize()
+        synchronize()
         t0 = time.perf_counter()
         split(lqs)
-        torch.cuda.synchronize()
+        synchronize()
         durations.append(time.perf_counter() - t0)
 
     med = statistics.median(durations)
@@ -197,7 +199,7 @@ def benchmark_basicvsrpp_restoration(
             for _ in range(RUNS):
                 start = time.perf_counter()
                 restorer.raw_process(video)
-                torch.cuda.synchronize()
+                synchronize()
                 durations.append(time.perf_counter() - start)
 
         med = statistics.median(durations)

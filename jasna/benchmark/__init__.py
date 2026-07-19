@@ -6,6 +6,8 @@ from argparse import Namespace
 
 import torch
 
+from jasna.accelerator import device_context
+
 from jasna.benchmark.basicvsrpp_restoration import benchmark_basicvsrpp_restoration
 from jasna.benchmark.lada_yolo_detection_speed import benchmark_lada_yolo_detection_speed
 from jasna.benchmark.rfdetr_detection_speed import benchmark_rfdetr_detection_speed
@@ -46,7 +48,7 @@ def run_benchmarks(
                 print(f"  {fn.__name__}")
             return
 
-    with torch.cuda.device(device):
+    with device_context(device):
         for benchmark_fn in fns:
             table_rows = benchmark_fn(
                 device=device,

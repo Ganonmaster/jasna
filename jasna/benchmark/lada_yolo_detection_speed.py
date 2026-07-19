@@ -5,6 +5,8 @@ from pathlib import Path
 
 import torch
 
+from jasna.accelerator import synchronize
+
 from jasna.benchmark.harness import run_repeatedly
 from jasna.media import get_video_meta_data
 from jasna.media.video_decoder import NvidiaVideoReader
@@ -67,7 +69,7 @@ def _run_single(
             for i in range(effective_bs):
                 total_detections += len(detections.boxes_xyxy[i])
 
-        torch.cuda.synchronize()
+        synchronize()
         duration = time.perf_counter() - start
 
     return duration, {

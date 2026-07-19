@@ -5,6 +5,8 @@ from typing import Callable
 
 import torch
 
+from jasna.accelerator import synchronize
+
 
 def run_repeatedly(
     fn: Callable[[], tuple[float, dict]],
@@ -15,5 +17,5 @@ def run_repeatedly(
     for _ in range(runs):
         duration, result = fn()
         durations.append(duration)
-        torch.cuda.synchronize()
+        synchronize()
     return statistics.median(durations), result
