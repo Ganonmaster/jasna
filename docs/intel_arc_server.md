@@ -9,9 +9,11 @@ Scope of Intel support (as of the initial port):
 - CLI batch export (`jasna --input … --output …`) and streaming (`--stream`).
 - Detection: RF-DETR (via OpenVINO GPU) and YOLO models (eager PyTorch on xpu).
 - Restoration: BasicVSR++ in eager PyTorch (fp32 — see the deform-conv note below).
-- Not available on Intel: the GUI, `--secondary-restoration rtx-super-res`
-  (Nvidia Maxine hardware SDK) and `--secondary-restoration unet-4x` (TensorRT-only
-  for now). `tvai` (external Topaz ffmpeg) works.
+- Not available on Intel: the GUI, and `--secondary-restoration` of any kind.
+  As on the AMD build, secondary restoration is gated to NVIDIA for now —
+  `rtx-super-res` (Nvidia Maxine SDK) and `unet-4x` (TensorRT) have no Intel
+  equivalent, and `tvai` (external Topaz ffmpeg) is currently blocked by the same
+  gate. Primary BasicVSR++ restoration is the Intel path.
 
 ## Host requirements
 
