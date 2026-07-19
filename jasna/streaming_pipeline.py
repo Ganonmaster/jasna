@@ -8,6 +8,7 @@ from queue import Empty, Queue
 
 import torch
 
+from jasna.accelerator import empty_cache, ipc_collect, reset_peak_memory_stats
 from jasna.blend_buffer import BlendBuffer
 from jasna.crop_buffer import CropBuffer
 from jasna.frame_queue import FrameQueue
@@ -113,9 +114,9 @@ def run_streaming(
         if own_server:
             hls_server.stop()
         gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-        torch.cuda.reset_peak_memory_stats(device)
+        empty_cache(device)
+        ipc_collect(device)
+        reset_peak_memory_stats(device)
 
 
 def _streaming_loop(

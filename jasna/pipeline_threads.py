@@ -8,6 +8,7 @@ from typing import Protocol
 
 import torch
 
+from jasna.accelerator import set_device
 from jasna.blend_buffer import BlendBuffer
 from jasna.crop_buffer import CropBuffer
 from jasna.frame_queue import FrameQueue
@@ -59,7 +60,7 @@ def decode_detect_loop(
 ) -> None:
     timer = LoopTimer("decode-detect")
     try:
-        torch.cuda.set_device(device)
+        set_device(device)
         tracker = ClipTracker(max_clip_size=max_clip_size, temporal_overlap=temporal_overlap)
         discard_margin = temporal_overlap
         blend_frames = (temporal_overlap // 3) if enable_crossfade else 0
@@ -232,7 +233,7 @@ def primary_restore_loop(
 ) -> None:
     timer = LoopTimer("primary")
     try:
-        torch.cuda.set_device(device)
+        set_device(device)
         log.debug("[primary] thread starting")
         while True:
             if cancel_event is not None and cancel_event.is_set():
@@ -291,7 +292,7 @@ def secondary_restore_loop(
 ) -> None:
     timer = LoopTimer("secondary")
     try:
-        torch.cuda.set_device(device)
+        set_device(device)
         log.debug("[secondary] thread starting")
         while True:
             if cancel_event is not None and cancel_event.is_set():
@@ -352,7 +353,7 @@ def blend_encode_loop(
 ) -> None:
     timer = LoopTimer("blend-encode")
     try:
-        torch.cuda.set_device(device)
+        set_device(device)
 
         def _flat_frames(rdr: NvidiaVideoReader):
             for batch, pts in rdr.frames(seek_ts=seek_ts):

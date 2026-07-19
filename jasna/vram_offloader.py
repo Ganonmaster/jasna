@@ -8,6 +8,7 @@ import traceback
 
 import torch
 
+from jasna.accelerator import device_module, empty_cache, mem_get_info
 from jasna.blend_buffer import BlendBuffer
 from jasna.crop_buffer import CropBuffer
 
@@ -76,9 +77,12 @@ class VramOffloader:
         if vram_limit is not None:
             gpu_total = int(vram_limit * 1024 * 1024 * 1024)
         else:
-            gpu_total = torch.cuda.get_device_properties(device).total_memory
+            gpu_total = mem_get_info(device)[1]
         self._threshold = max(0, gpu_total - safetynet)
-        self._offload_device_type = "cuda"
+        # Frames/crops are offloaded off whatever device they live on — cuda on
+        # NVIDIA/AMD, xpu on Intel. Hardcoding "cuda" here would silently disable
+        # offloading on xpu (the device.type check below would never match).
+        self._offload_device_type = device.type
 
         self.stats = VramStats()
         self._stop = threading.Event()
@@ -123,13 +127,13 @@ class VramOffloader:
 
     def _run(self) -> None:
         while not self._stop.wait(_POLL_INTERVAL):
-            free, total = torch.cuda.mem_get_info(self._device)
+            free, total = mem_get_info(self._device)
             used = total - free
             self.stats.update(used)
             if used > self._threshold:
                 freed = self._offload(used - self._threshold)
                 if freed > 0:
-                    torch.cuda.empty_cache()
+                    empty_cache(self._device)
                     self.stats.offload_count += 1
                     self.stats.total_offloaded_bytes += freed
                     _log.debug(
@@ -218,9 +222,9 @@ class VramOffloader:
 
         # VRAM
         try:
-            free, total = torch.cuda.mem_get_info(self._device)
-            alloc = torch.cuda.memory_allocated(self._device)
-            reserved = torch.cuda.memory_reserved(self._device)
+            free, total = mem_get_info(self._device)
+            alloc = device_module(self._device).memory_allocated(self._device)
+            reserved = device_module(self._device).memory_reserved(self._device)
             lines.append(
                 f"  VRAM: used={((total - free) / _MIB):.0f} MiB"
                 f" allocated={alloc / _MIB:.0f} MiB"

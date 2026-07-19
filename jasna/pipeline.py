@@ -17,6 +17,13 @@ import psutil
 import torch
 
 from jasna._frozen import patch_frozen_torch
+from jasna.accelerator import (
+    empty_cache,
+    ipc_collect,
+    mem_get_info,
+    reset_peak_memory_stats,
+    set_device,
+)
 patch_frozen_torch()
 
 from jasna.media import UnsupportedColorspaceError, get_video_meta_data
@@ -367,7 +374,7 @@ class Pipeline:
         def _async_secondary_thread():
             nonlocal starvation_stats
             try:
-                torch.cuda.set_device(device)
+                set_device(device)
                 starvation_stats = self._run_secondary_loop(secondary_queue, encode_queue, debug_memory, clip_queue, primary_idle_event)
             except BaseException as e:
                 log.exception("[secondary-async] thread crashed")
@@ -462,7 +469,7 @@ class Pipeline:
 
         _process = psutil.Process(os.getpid())
         try:
-            free, total = torch.cuda.mem_get_info(device)
+            free, total = mem_get_info(device)
             vram_used = total - free
             log.info("VRAM usage at end — %.1f MiB", vram_used / (1024 ** 2))
         except Exception:
@@ -488,9 +495,9 @@ class Pipeline:
         del blend_buffer, crop_buffers
         del error_holder, threads
         gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-        torch.cuda.reset_peak_memory_stats(self.device)
+        empty_cache(self.device)
+        ipc_collect(self.device)
+        reset_peak_memory_stats(self.device)
 
         if err is not None:
             raise err
