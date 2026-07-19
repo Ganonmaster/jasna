@@ -171,11 +171,11 @@ class NvidiaVideoReader:
             decoder.options = {"gpu_copy": "on"}
             if source_ctx.extradata:
                 decoder.extradata = source_ctx.extradata
-            decoder.width = source_ctx.width
-            decoder.height = source_ctx.height
-            decoder.time_base = source_ctx.time_base
-            decoder.framerate = source_ctx.framerate
-            decoder.sample_aspect_ratio = source_ctx.sample_aspect_ratio
+            # Unlike the AMF decoder (created WITH a hwaccel), this copy-back
+            # context is hwaccel-less, and PyAV rejects setting stream props like
+            # time_base on it ("Cannot access 'time_base' as a decoder"). The
+            # decoder recovers width/height/timing from the bitstream + extradata,
+            # so only options + extradata are needed before open().
             decoder.open(strict=False)
             self._decoder_ctx = decoder
             log.info("Using QSV hardware decoder %s for %s", decoder_name, self.file)

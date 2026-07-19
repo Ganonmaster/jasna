@@ -461,13 +461,12 @@ class NvidiaVideoEncoder:
                 allow_software_fallback=False,
                 is_hw_owned=False,
             )
-        elif self.vendor is AcceleratorVendor.INTEL:
-            stream_kwargs["hwaccel"] = HWAccel(
-                "qsv",
-                device=str(self.device.index or 0),
-                allow_software_fallback=False,
-                is_hw_owned=False,
-            )
+        # QSV takes NO hwaccel device context, unlike AMF. Building an explicit
+        # QSV hwdevice goes through av_hwdevice_ctx_create, which on the bundled
+        # FFmpeg fails with "No supported child device type is enabled" (it needs
+        # a VAAPI/D3D11 child that isn't compiled in). Instead we hand h264_qsv
+        # the packed system-memory nv12/p010le frame and let the encoder spin up
+        # its own internal oneVPL session (the copy-back encode path).
         # Serialize codec init against the pipeline's decoder opens (see
         # codec_open_lock) — concurrent hardware avcodec_open2 deadlocks.
         with codec_open_lock:

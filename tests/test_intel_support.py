@@ -160,23 +160,57 @@ def test_streaming_encoder_selects_qsv(monkeypatch, tmp_path) -> None:
     assert "h264_amf" not in cmd
 
 
+class _FakeCopyBackDecoder:
+    """A copy-back (hwaccel-less) decoder context. PyAV rejects setting stream
+    properties like time_base on such a context ("Cannot access 'time_base' as a
+    decoder"), so this fake raises on those to catch a regression that reintroduces
+    the setters — the decoder must be configured with options + extradata only."""
+
+    _DECODER_ONLY_PROPS = frozenset(
+        {"time_base", "width", "height", "framerate", "sample_aspect_ratio"}
+    )
+
+    def __init__(self) -> None:
+        object.__setattr__(self, "options", None)
+        object.__setattr__(self, "extradata", None)
+        object.__setattr__(self, "opened_strict", None)
+
+    def __setattr__(self, name, value):
+        if name in self._DECODER_ONLY_PROPS:
+            raise ValueError(f"Cannot access '{name}' as a decoder")
+        object.__setattr__(self, name, value)
+
+    def open(self, strict):
+        object.__setattr__(self, "opened_strict", strict)
+
+
+def test_qsv_encoder_uses_no_hwaccel_device() -> None:
+    # QSV must NOT get an explicit HWAccel device context: av_hwdevice_ctx_create
+    # for qsv fails on the bundled FFmpeg ("No supported child device type is
+    # enabled"). h264_qsv builds its own internal oneVPL session from the packed
+    # system-memory frame instead. Only AMF takes a HWAccel.
+    import inspect
+    import re
+
+    import jasna.media.video_encoder as module
+
+    source = inspect.getsource(module)
+    hwaccel_kinds = set(re.findall(r'HWAccel\(\s*["\'](\w+)["\']', source))
+    assert "qsv" not in hwaccel_kinds, (
+        f"QSV must not use an explicit HWAccel device context; found {hwaccel_kinds}"
+    )
+
+
 def test_qsv_decoder_context_is_created(monkeypatch) -> None:
     import jasna.media.video_decoder as module
 
-    decoder = MagicMock()
+    decoder = _FakeCopyBackDecoder()
+    create = MagicMock(return_value=decoder)
     monkeypatch.setattr(
-        module.av,
-        "CodecContext",
-        SimpleNamespace(create=MagicMock(return_value=decoder)),
+        module.av, "CodecContext", SimpleNamespace(create=create)
     )
-    monkeypatch.setattr(
-        "jasna.media.qsv.qsv_decoder_name",
-        lambda _codec: "h264_qsv",
-    )
-    monkeypatch.setattr(
-        "jasna.media.qsv.qsv_decoder_available",
-        lambda _codec: True,
-    )
+    monkeypatch.setattr("jasna.media.qsv.qsv_decoder_name", lambda _codec: "h264_qsv")
+    monkeypatch.setattr("jasna.media.qsv.qsv_decoder_available", lambda _codec: True)
     reader = module.NvidiaVideoReader(
         "input.mp4",
         4,
@@ -194,8 +228,10 @@ def test_qsv_decoder_context_is_created(monkeypatch) -> None:
         thread_type=None,
     )
     reader._setup_qsv_decoder(source)
-    create = module.av.CodecContext.create
+    # If a stream-prop setter is reintroduced, _FakeCopyBackDecoder raises, the
+    # method's except swallows it, and _decoder_ctx stays None — failing here.
     assert create.call_args.args[:2] == ("h264_qsv", "r")
     assert decoder.options == {"gpu_copy": "on"}
-    decoder.open.assert_called_once_with(strict=False)
+    assert decoder.extradata == b"header"
+    assert decoder.opened_strict is False
     assert reader._decoder_ctx is decoder
