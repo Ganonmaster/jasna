@@ -154,6 +154,24 @@ failure falls back to eager with a warning; it cannot break a run.
 `JASNA_COMPILE_MODE=max-autotune` trades a longer compile for potentially
 faster kernels (unmeasured).
 
+### INT8 detection, step 1: calibration frames
+
+Quantizing RF-DETR to INT8 (the main detection-speed lever on the B50) needs a
+few hundred representative frames. The extractor builds them hands-off from a
+media library — probing every video sparsely with the fast YOLO detector,
+keeping mosaic scenes across three strata (confident / borderline / none) and
+spreading picks across visual looks, videos, and time:
+
+```bash
+python -m jasna.calibration_frames --library /path/to/library \
+    --out calibration_frames --count 800 --device xpu:0
+```
+
+Progress prints per 10 videos; an interrupted run resumes from the probe cache
+in the output directory. Output: `calib_*.png` frames + `manifest.json` (source,
+timestamp, detector score, stratum, and visual features per frame). Unreadable
+files are skipped and counted, never fatal.
+
 ### Profiling the deform-conv share (native-kernel ROI)
 
 `torchvision.ops.deform_conv2d` has no XPU kernel, so xpu runs a grid_sample
