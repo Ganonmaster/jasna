@@ -134,6 +134,20 @@ Intel (restoration has spare capacity behind it). The main lever left to speed i
 up is **INT8 quantization** (planned): the B50's INT8 throughput (170 TOPS) is
 ~8× its fp16, so an INT8 RF-DETR is the route to push detection past ~30 fps.
 
+### Profiling the deform-conv share (native-kernel ROI)
+
+`torchvision.ops.deform_conv2d` has no XPU kernel, so xpu runs a grid_sample
+composition (see above). To measure what that costs — and what a fused
+Triton/SYCL kernel or `torch.compile` could recover — run the opt-in profile:
+
+```bash
+jasna --benchmark --benchmark-filter deform --device xpu:0
+```
+
+It reports deform's share of a 60-frame clip, a per-stage breakdown of the
+composition, a measured bandwidth floor (the fused-kernel ceiling), and a
+`torch.compile` probe (skip with `JASNA_PROFILE_COMPILE=0`).
+
 ### Performance expectations
 
 The B50 is a 224 GB/s, ~21 TFLOPS-fp16 card; BasicVSR++ is bandwidth-bound.

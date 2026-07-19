@@ -9,6 +9,7 @@ import torch
 from jasna.accelerator import device_context
 
 from jasna.benchmark.basicvsrpp_restoration import benchmark_basicvsrpp_restoration
+from jasna.benchmark.deform_profile import benchmark_deform_profile
 from jasna.benchmark.lada_yolo_detection_speed import benchmark_lada_yolo_detection_speed
 from jasna.benchmark.rfdetr_detection_speed import benchmark_rfdetr_detection_speed
 from jasna.os_utils import check_required_executables, check_supported_gpu
@@ -23,6 +24,10 @@ BENCHMARKS = [
     benchmark_rfdetr_detection_speed,
     benchmark_lada_yolo_detection_speed,
 ]
+
+# Diagnostic profiles: opt-in via --benchmark-filter only, never part of the
+# default `--benchmark` run.
+PROFILES = [benchmark_deform_profile]
 
 
 def run_benchmarks(
@@ -41,10 +46,10 @@ def run_benchmarks(
 
     fns = BENCHMARKS
     if benchmark_filter:
-        fns = [fn for fn in fns if benchmark_filter in fn.__name__]
+        fns = [fn for fn in BENCHMARKS + PROFILES if benchmark_filter in fn.__name__]
         if not fns:
             print(f"No benchmarks matching filter '{benchmark_filter}'. Available:")
-            for fn in BENCHMARKS:
+            for fn in BENCHMARKS + PROFILES:
                 print(f"  {fn.__name__}")
             return
 
