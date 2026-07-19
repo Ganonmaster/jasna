@@ -61,6 +61,11 @@ from jasna.benchmark.basicvsrpp_restoration import benchmark_basicvsrpp_restorat
 # The `jasna --image` SD1.5 restoration CLI path is a separate dispatch.
 import jasna.image_restore
 
+# INT8 tooling entry points run on Intel builds (nncf/openvino import lazily).
+import jasna.calibration_frames
+import jasna.quantize_rfdetr
+import jasna.detection_ab
+
 # Module imports alone don't cover call-time imports (a bare `import tensorrt`
 # inside a function body); exercise the startup-path functions every non-CUDA
 # run goes through.

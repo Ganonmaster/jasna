@@ -22,13 +22,14 @@ def _run_single(
     fp16: bool,
     video_path: Path,
     score_threshold: float,
+    model_name: str = DEFAULT_DETECTION_MODEL_NAME,
 ) -> tuple[float, dict]:
     path = video_path.resolve()
     if not path.exists():
         raise FileNotFoundError(str(path))
 
     metadata = get_video_meta_data(str(path))
-    model_path = detection_model_weights_path(DEFAULT_DETECTION_MODEL_NAME)
+    model_path = detection_model_weights_path(model_name)
     if not model_path.exists():
         raise FileNotFoundError(str(model_path))
 
@@ -85,8 +86,19 @@ def benchmark_rfdetr_detection_speed(
     fp16: bool,
     benchmark_videos: list[Path],
     detection_score_threshold: float,
+    detection_model: str | None = None,
     **_: object,
 ) -> dict[str, tuple[float, float]]:
+    # Honor --detection-model when it names an RF-DETR variant (e.g. the
+    # NNCF-quantized rfdetr-v5-int8); non-RF-DETR names keep the default so a
+    # plain `--benchmark --detection-model lada-yolo-v4` run still covers both.
+    from jasna.mosaic.detection_registry import is_rfdetr_model
+
+    model_name = (
+        detection_model
+        if detection_model and is_rfdetr_model(str(detection_model).strip().lower())
+        else DEFAULT_DETECTION_MODEL_NAME
+    )
     results: dict[str, tuple[float, float]] = {}
     for video_path in benchmark_videos:
         path = video_path.resolve()
@@ -99,6 +111,7 @@ def benchmark_rfdetr_detection_speed(
                 fp16=fp16,
                 video_path=vp,
                 score_threshold=detection_score_threshold,
+                model_name=model_name,
             ),
             runs=3,
         )

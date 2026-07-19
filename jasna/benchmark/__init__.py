@@ -41,6 +41,7 @@ def run_benchmarks(
     restoration_model_path: Path | None = None,
     compile_basicvsrpp: bool = True,
     benchmark_filter: str | None = None,
+    detection_model: str | None = None,
 ) -> None:
     results: dict[str, dict[str, tuple[float, float]]] = {}
     videos_to_run = [p for p in benchmark_videos if p.resolve().exists()]
@@ -64,6 +65,7 @@ def run_benchmarks(
                 detection_score_threshold=detection_score_threshold,
                 restoration_model_path=restoration_model_path,
                 compile_basicvsrpp=compile_basicvsrpp,
+                detection_model=detection_model,
             )
             if table_rows is not None:
                 results[benchmark_fn.__name__.replace("benchmark_", "")] = table_rows
@@ -126,4 +128,5 @@ def run_benchmark_cli(args: Namespace) -> None:
         restoration_model_path=Path(args.restoration_model_path),
         compile_basicvsrpp=bool(args.compile_basicvsrpp),
         benchmark_filter=getattr(args, 'benchmark_filter', None),
+        detection_model=getattr(args, 'detection_model', None),
     )

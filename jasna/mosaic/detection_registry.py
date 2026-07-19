@@ -67,10 +67,14 @@ def detection_model_spec(name: str) -> DetectionModelSpec:
     if spec is not None:
         return spec
     if is_rfdetr_model(normalized):
+        # NNCF-quantized variants are saved as OpenVINO IR (.xml + .bin),
+        # produced by `python -m jasna.quantize_rfdetr`; they run through the
+        # same OvRunner path (core.read_model handles IR and ONNX alike).
+        suffix = "xml" if normalized.endswith("-int8") else "onnx"
         return DetectionModelSpec(
             normalized,
             "rfdetr",
-            f"{normalized}.onnx",
+            f"{normalized}.{suffix}",
         )
     valid = sorted(RFDETR_MODEL_NAMES | set(DETECTION_MODEL_SPECS))
     raise ValueError(
@@ -84,7 +88,10 @@ def discover_available_detection_models(weights_dir: Path | None = None) -> list
     yolo_names: list[str] = []
     if weights_dir.is_dir():
         for f in weights_dir.iterdir():
-            if f.suffix == ".onnx" and is_rfdetr_model(f.stem):
+            # .onnx = the fp16 models; .xml with an -int8 stem = NNCF-quantized
+            # OpenVINO IR variants from `python -m jasna.quantize_rfdetr`.
+            is_int8_ir = f.suffix == ".xml" and f.stem.endswith("-int8")
+            if (f.suffix == ".onnx" or is_int8_ir) and is_rfdetr_model(f.stem):
                 rfdetr_names.append(f.stem)
         yolo_files_reverse = {v: k for k, v in YOLO_MODEL_FILES.items()}
         for f in weights_dir.iterdir():

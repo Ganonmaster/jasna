@@ -172,6 +172,34 @@ in the output directory. Output: `calib_*.png` frames + `manifest.json` (source,
 timestamp, detector score, stratum, and visual features per frame). Unreadable
 files are skipped and counted, never fatal.
 
+### INT8 detection, steps 2–4: quantize, speed-check, quality-gate
+
+```bash
+pip install nncf   # one-time build tool, not a jasna runtime dependency
+
+# 2. Quantize (writes model_weights/rfdetr-v5-int8.xml + .bin)
+python -m jasna.quantize_rfdetr --calibration calibration_frames
+
+# 3. Speed: INT8 vs the fp16 baseline
+jasna --benchmark --benchmark-filter rfdetr --device xpu:0                                  # fp16
+jasna --benchmark --benchmark-filter rfdetr --detection-model rfdetr-v5-int8 --device xpu:0 # int8
+
+# 4. Quality gate: build an eval set with a DIFFERENT seed than calibration,
+#    then compare the two models frame-by-frame
+python -m jasna.calibration_frames --library /path/to/library \
+    --out eval_frames --count 400 --seed 999 --device xpu:0
+python -m jasna.detection_ab --frames eval_frames --device xpu:0
+```
+
+The A/B reports, per stratum, how many of the fp16 model's detections the INT8
+model misses (a miss = a mosaic left visible), frames where it is fully blind,
+new false positives, and box/mask IoU drift — `ab_report.json` holds the
+details. If the borderline-stratum miss rate is unacceptable, rerun step 2 with
+`--ignored-scope-json` to keep the most sensitive layers in fp precision, or
+escalate to NNCF's accuracy-controlled mode. Only after the gate passes, use
+`--detection-model rfdetr-v5-int8` in production runs (Intel/OpenVINO-only —
+the NVIDIA path rejects it with a clear error).
+
 ### Profiling the deform-conv share (native-kernel ROI)
 
 `torchvision.ops.deform_conv2d` has no XPU kernel, so xpu runs a grid_sample

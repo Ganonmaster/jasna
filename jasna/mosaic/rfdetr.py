@@ -20,12 +20,23 @@ def TrtRunner(*args, **kwargs):
     return Runner(*args, **kwargs)
 
 
+def _require_onnx_on_non_intel(model_path: Path, device: torch.device) -> None:
+    """The NNCF-quantized INT8 variants are OpenVINO IR (.xml) and run only on
+    Intel; MIGraphX/TensorRT would fail on them with cryptic loader errors."""
+    if model_path.suffix.lower() != ".onnx" and not is_intel_device(device):
+        raise RuntimeError(
+            f"{model_path.name} is an OpenVINO IR (INT8) model; it runs only on "
+            "Intel via OpenVINO — use the fp16 .onnx model on this device"
+        )
+
+
 def compile_rfdetr_engine(
     onnx_path: Path,
     device: torch.device,
     batch_size: int,
     fp16: bool = True,
 ) -> Path:
+    _require_onnx_on_non_intel(onnx_path, device)
     if is_amd_device(device):
         from jasna.mosaic.migraphx_runner import MigraphxRunner
 
@@ -91,6 +102,7 @@ class RfDetrMosaicDetectionModel:
         self.score_threshold = float(score_threshold)
         self.max_select = int(max_select)
 
+        _require_onnx_on_non_intel(self.onnx_path, self.device)
         if is_amd_device(self.device):
             from jasna.mosaic.migraphx_runner import MigraphxRunner
 
@@ -117,6 +129,12 @@ class RfDetrMosaicDetectionModel:
             )
             self.engine_path = cache_dir
         elif is_nvidia_device(self.device):
+            if self.onnx_path.suffix.lower() != ".onnx":
+                raise RuntimeError(
+                    f"{self.onnx_path.name} is an OpenVINO IR (INT8) model; it "
+                    "runs only on Intel via OpenVINO — use the fp16 .onnx model "
+                    "on NVIDIA"
+                )
             self.engine_path = get_onnx_tensorrt_engine_path(
                 self.onnx_path, batch_size=self.batch_size, fp16=bool(fp16),
             )
