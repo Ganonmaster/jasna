@@ -181,3 +181,30 @@ def test_setup_failure_is_contained(monkeypatch, tmp_path):
     assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == str(tmp_path / "torchinductor_cache")
     r.raw_process(_video(4))
     assert r._calls["eager"] == 1
+
+
+def _setup_with_noop_compile(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv(TORCH_COMPILE_ENV, "1")
+    monkeypatch.setattr(torch, "compile", lambda gen, mode=None: gen)
+    r = _make_restorer(max_clip_size=1)
+    r._compiled_generator = None
+    r._setup_torch_compile(str(tmp_path / "model.pth"))
+
+
+def test_cache_dir_overrides_torch_written_default(monkeypatch, tmp_path):
+    """torch's cache_dir() writes its default into os.environ before we run
+    (triggered by jasna's import chain) — that value must be replaced, not
+    treated as a user setting. The regression this pins: setdefault silently
+    losing to torch's self-written default."""
+    from torch._inductor.runtime.cache_dir_utils import default_cache_dir
+
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", default_cache_dir())
+    _setup_with_noop_compile(monkeypatch, tmp_path)
+    assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == str(tmp_path / "torchinductor_cache")
+
+
+def test_cache_dir_respects_user_setting(monkeypatch, tmp_path):
+    custom = str(tmp_path / "my_custom_cache")
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", custom)
+    _setup_with_noop_compile(monkeypatch, tmp_path)
+    assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == custom

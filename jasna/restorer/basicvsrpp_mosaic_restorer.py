@@ -78,12 +78,30 @@ class BasicvsrppMosaicRestorer:
         at startup (like the TensorRT engine build), not mid-pipeline where it
         would trip the encode-stall watchdog. Any failure falls back to eager."""
         # Persist compiled kernels next to the model weights so the cache
-        # survives reboots (the /tmp default does not). Must be set before the
-        # first inductor use in this process; an explicit user setting wins.
-        os.environ.setdefault(
-            "TORCHINDUCTOR_CACHE_DIR",
-            str(Path(checkpoint_path).resolve().parent / "torchinductor_cache"),
-        )
+        # survives reboots (the /tmp default does not). setdefault is NOT
+        # enough: torch's cache_dir() writes its computed default back into
+        # os.environ on first use, and jasna's import chain triggers that
+        # before we run. So override when the value is unset OR torch's own
+        # default; only an explicit user setting is respected. cache_dir()
+        # re-reads the env per call (and triton's cache nests under it), so
+        # overriding here still takes effect.
+        persistent = str(Path(checkpoint_path).resolve().parent / "torchinductor_cache")
+        current = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+        try:
+            from torch._inductor.runtime.cache_dir_utils import default_cache_dir
+
+            torch_default = default_cache_dir()
+        except Exception:  # pragma: no cover - private torch API moved
+            import getpass
+            import re
+            import tempfile
+
+            torch_default = os.path.join(
+                tempfile.gettempdir(),
+                "torchinductor_" + re.sub(r'[\\/:*?"<>|]', "_", getpass.getuser()),
+            )
+        if current is None or os.path.normpath(current) == os.path.normpath(torch_default):
+            os.environ["TORCHINDUCTOR_CACHE_DIR"] = persistent
         self._gen_attr = (
             "generator_ema"
             if getattr(self.model, "generator_ema", None) is not None
