@@ -102,9 +102,15 @@ def benchmark_compile_profile(
         print(f"\n=== summary: eager {eager_ms:.1f} ms vs compiled {compiled_ms:.1f} ms "
               f"-> {eager_ms / compiled_ms:.2f}x ===")
         print("  (4090 reference: TensorRT achieves 3.09x over eager — 459.5 -> 148.7 ms.)")
-        print("  Caveat: production clips vary in length; variable T can trigger dynamo")
-        print("  recompiles. If the speedup here is compelling, production wiring needs")
-        print("  dynamic-shape handling plus the Level Zero headers as a runtime dep.")
+        cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+        print(f"  inductor cache: {cache_dir or 'default (/tmp/torchinductor_<user> — cleared on reboot)'}")
+        print("  Compiled kernels persist in that cache: RE-RUN THIS COMMAND to measure")
+        print("  the warm-start compile time — that, not the first-run time, is the")
+        print("  recurring cost of a production wiring. Set TORCHINDUCTOR_CACHE_DIR to a")
+        print("  persistent path to keep the cache across reboots.")
+        print("  Caveat: production clips vary in length; variable T triggers dynamo")
+        print("  recompiles unless clips are padded to a fixed length (or T is exported")
+        print("  as a dynamic dim via AOTInductor, mirroring TRT's dynamic batch).")
     except Exception as exc:  # noqa: BLE001 - report-and-continue diagnostics tool
         print(f"  torch.compile failed on this backend: {exc}")
     finally:
