@@ -134,6 +134,26 @@ Intel (restoration has spare capacity behind it). The main lever left to speed i
 up is **INT8 quantization** (planned): the B50's INT8 throughput (170 TOPS) is
 ~8× its fp16, so an INT8 RF-DETR is the route to push detection past ~30 fps.
 
+### Optional: torch.compile the restoration graph (~1.3x, opt-in)
+
+BasicVSR++ runs eager on xpu (the TensorRT path is NVIDIA-only). Opting in to
+torch.compile recovers part of that gap — measured ~1.3x on full clips on the
+B50 (1068 -> 834 ms/clip):
+
+```bash
+sudo apt install libze-dev   # Level Zero headers; triton-xpu JIT needs them
+JASNA_TORCH_COMPILE=1 jasna --input in.mp4 --output out.mkv --device xpu:0
+```
+
+The first run per machine compiles for ~30 minutes during startup (the same
+one-time cost as the NVIDIA TensorRT engine build); compiled kernels persist in
+`<model dir>/torchinductor_cache`, so later runs start in ~1 minute. Only
+full-length clips run compiled — shorter tail clips run eager (each distinct
+clip length would trigger a fresh multi-minute compile). Any compile or runtime
+failure falls back to eager with a warning; it cannot break a run.
+`JASNA_COMPILE_MODE=max-autotune` trades a longer compile for potentially
+faster kernels (unmeasured).
+
 ### Profiling the deform-conv share (native-kernel ROI)
 
 `torchvision.ops.deform_conv2d` has no XPU kernel, so xpu runs a grid_sample

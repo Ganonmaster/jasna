@@ -296,7 +296,10 @@ def benchmark_deform_profile(
     restoration_model_path: Path | None,
     **_: object,
 ) -> None:
-    from jasna.restorer.basicvsrpp_mosaic_restorer import BasicvsrppMosaicRestorer
+    from jasna.restorer.basicvsrpp_mosaic_restorer import (
+        TORCH_COMPILE_ENV,
+        BasicvsrppMosaicRestorer,
+    )
 
     print(f"\n=== deform_conv2d profile on {device} ({device_name(device)}), "
           f"fp16={fp16} ===")
@@ -305,14 +308,24 @@ def benchmark_deform_profile(
         return
 
     # Eager everywhere: TensorRT would bypass the deform dispatch on NVIDIA,
-    # and eager is the path comparable to xpu.
-    restorer = BasicvsrppMosaicRestorer(
-        checkpoint_path=str(restoration_model_path.resolve()),
-        device=device,
-        max_clip_size=CLIP_LENGTH,
-        use_tensorrt=False,
-        fp16=fp16,
-    )
+    # and eager is the path comparable to xpu. The production
+    # JASNA_TORCH_COMPILE wiring must also stay off — a dynamo-compiled
+    # generator would graph-break/recompile on the monkeypatched deform
+    # dispatch and corrupt the instrumented timings.
+    prev_flag = os.environ.pop(TORCH_COMPILE_ENV, None)
+    if prev_flag is not None:
+        print(f"  (note: {TORCH_COMPILE_ENV} was set; ignored inside this profile)")
+    try:
+        restorer = BasicvsrppMosaicRestorer(
+            checkpoint_path=str(restoration_model_path.resolve()),
+            device=device,
+            max_clip_size=CLIP_LENGTH,
+            use_tensorrt=False,
+            fp16=fp16,
+        )
+    finally:
+        if prev_flag is not None:
+            os.environ[TORCH_COMPILE_ENV] = prev_flag
     video = [
         torch.randint(0, 256, (3, SIZE, SIZE), dtype=torch.uint8, device=device)
         for _ in range(CLIP_LENGTH)

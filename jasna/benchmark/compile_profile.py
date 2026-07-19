@@ -53,7 +53,10 @@ def benchmark_compile_profile(
     restoration_model_path: Path | None,
     **_: object,
 ) -> None:
-    from jasna.restorer.basicvsrpp_mosaic_restorer import BasicvsrppMosaicRestorer
+    from jasna.restorer.basicvsrpp_mosaic_restorer import (
+        TORCH_COMPILE_ENV,
+        BasicvsrppMosaicRestorer,
+    )
 
     print(f"\n=== whole-model torch.compile profile on {device} "
           f"({device_name(device)}), fp16={fp16} ===")
@@ -61,13 +64,24 @@ def benchmark_compile_profile(
         print("Restoration model weights not found; skipping.")
         return
 
-    restorer = BasicvsrppMosaicRestorer(
-        checkpoint_path=str(restoration_model_path.resolve()),
-        device=device,
-        max_clip_size=CLIP_LENGTH,
-        use_tensorrt=False,
-        fp16=fp16,
-    )
+    # The production JASNA_TORCH_COMPILE wiring must stay OFF inside this probe:
+    # with it active, the "eager" baseline would silently run the production-
+    # compiled generator (60 frames == max_clip_size) and the probe's own swap
+    # would be overwritten every call — both numbers ~1.0x and wrong.
+    prev_flag = os.environ.pop(TORCH_COMPILE_ENV, None)
+    if prev_flag is not None:
+        print(f"  (note: {TORCH_COMPILE_ENV} was set; ignored inside this probe)")
+    try:
+        restorer = BasicvsrppMosaicRestorer(
+            checkpoint_path=str(restoration_model_path.resolve()),
+            device=device,
+            max_clip_size=CLIP_LENGTH,
+            use_tensorrt=False,
+            fp16=fp16,
+        )
+    finally:
+        if prev_flag is not None:
+            os.environ[TORCH_COMPILE_ENV] = prev_flag
     video = [
         torch.randint(0, 256, (3, SIZE, SIZE), dtype=torch.uint8, device=device)
         for _ in range(CLIP_LENGTH)
