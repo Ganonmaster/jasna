@@ -58,6 +58,9 @@ import jasna.benchmark
 from jasna.benchmark import run_benchmark_cli
 from jasna.benchmark.basicvsrpp_restoration import benchmark_basicvsrpp_restoration
 
+# The `jasna --image` SD1.5 restoration CLI path is a separate dispatch.
+import jasna.image_restore
+
 # Module imports alone don't cover call-time imports (a bare `import tensorrt`
 # inside a function body); exercise the startup-path functions every non-CUDA
 # run goes through.
