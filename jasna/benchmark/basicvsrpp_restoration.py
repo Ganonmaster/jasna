@@ -7,11 +7,13 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from jasna.accelerator import synchronize
+from jasna.accelerator import is_nvidia_device, synchronize
 
-from jasna.restorer.basicvrspp_tenorrt_compilation import basicvsrpp_startup_policy
 from jasna.restorer.basicvsrpp_mosaic_restorer import BasicvsrppMosaicRestorer
-from jasna.restorer.basicvsrpp_sub_engines import BasicVSRPlusPlusNetSplit
+
+# basicvrspp_tenorrt_compilation / basicvsrpp_sub_engines pull in jasna.trt ->
+# `import tensorrt`, which no AMD/Intel build ships. They are only needed on the
+# NVIDIA TensorRT split path, so both are imported lazily below.
 
 CLIP_LENGTH = 60
 SIZE = 256
@@ -29,7 +31,9 @@ def _timed(label: str, fn, *args, **kwargs):
     return result
 
 
-def _profile_split_forward(split: BasicVSRPlusPlusNetSplit, device: torch.device, dtype: torch.dtype) -> None:
+def _profile_split_forward(split: "BasicVSRPlusPlusNetSplit", device: torch.device, dtype: torch.dtype) -> None:
+    from jasna.restorer.basicvsrpp_sub_engines import BasicVSRPlusPlusNetSplit
+
     T = CLIP_LENGTH
     lqs = torch.randn(1, T, 3, SIZE, SIZE, device=device, dtype=dtype)
 
@@ -167,13 +171,19 @@ def benchmark_basicvsrpp_restoration(
         return
     path = restoration_model_path.resolve()
 
-    use_tensorrt = basicvsrpp_startup_policy(
-        restoration_model_path=str(path),
-        device=device,
-        fp16=fp16,
-        compile_basicvsrpp=compile_basicvsrpp,
-        max_clip_size=CLIP_LENGTH,
-    )
+    if is_nvidia_device(device):
+        from jasna.restorer.basicvrspp_tenorrt_compilation import basicvsrpp_startup_policy
+
+        use_tensorrt = basicvsrpp_startup_policy(
+            restoration_model_path=str(path),
+            device=device,
+            fp16=fp16,
+            compile_basicvsrpp=compile_basicvsrpp,
+            max_clip_size=CLIP_LENGTH,
+        )
+    else:
+        # AMD/Intel run BasicVSR++ eager; TensorRT is never used off NVIDIA.
+        use_tensorrt = False
     restorer = BasicvsrppMosaicRestorer(
         checkpoint_path=str(path),
         device=device,

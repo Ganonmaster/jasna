@@ -52,6 +52,12 @@ from jasna.restorer.restoration_pipeline import RestorationPipeline
 import jasna.engine_compiler
 import jasna.vram_offloader
 
+# The `jasna --benchmark --device xpu` CLI path: benchmark/__init__ eagerly
+# imports the per-benchmark modules, which must not drag in jasna.trt (tensorrt).
+import jasna.benchmark
+from jasna.benchmark import run_benchmark_cli
+from jasna.benchmark.basicvsrpp_restoration import benchmark_basicvsrpp_restoration
+
 # Module imports alone don't cover call-time imports (a bare `import tensorrt`
 # inside a function body); exercise the startup-path functions every non-CUDA
 # run goes through.
