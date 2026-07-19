@@ -9,6 +9,7 @@ import torch
 from jasna.accelerator import device_context
 
 from jasna.benchmark.basicvsrpp_restoration import benchmark_basicvsrpp_restoration
+from jasna.benchmark.compile_profile import benchmark_compile_profile
 from jasna.benchmark.deform_profile import benchmark_deform_profile
 from jasna.benchmark.lada_yolo_detection_speed import benchmark_lada_yolo_detection_speed
 from jasna.benchmark.rfdetr_detection_speed import benchmark_rfdetr_detection_speed
@@ -27,7 +28,7 @@ BENCHMARKS = [
 
 # Diagnostic profiles: opt-in via --benchmark-filter only, never part of the
 # default `--benchmark` run.
-PROFILES = [benchmark_deform_profile]
+PROFILES = [benchmark_deform_profile, benchmark_compile_profile]
 
 
 def run_benchmarks(

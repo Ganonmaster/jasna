@@ -67,7 +67,13 @@ def test_traffic_estimate_fused_below_current():
     assert est["cols_mb"] > 0
 
 
-def test_profile_is_not_in_the_default_benchmark_run():
+def test_profiles_are_not_in_the_default_benchmark_run():
     names = [fn.__name__ for fn in BENCHMARKS]
+    profile_names = [fn.__name__ for fn in PROFILES]
     assert "benchmark_deform_profile" not in names
-    assert any(fn.__name__ == "benchmark_deform_profile" for fn in PROFILES)
+    assert "benchmark_compile_profile" not in names
+    assert "benchmark_deform_profile" in profile_names
+    assert "benchmark_compile_profile" in profile_names
+    # `--benchmark-filter compile` must match ONLY the compile profile (no
+    # accidental substring hits on the default benchmarks).
+    assert [n for n in names + profile_names if "compile" in n] == ["benchmark_compile_profile"]
