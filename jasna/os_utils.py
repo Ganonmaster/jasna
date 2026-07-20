@@ -54,18 +54,27 @@ def check_supported_gpu(
         from jasna.accelerator import AcceleratorVendor, probe_xpu_subprocess, vendor_for_device
     except ImportError:
         return False, "no_cuda"
+    index = torch.device(device).index or 0
     # Intel is a genuine xpu device, so it satisfies no torch.cuda gate — check
     # it BEFORE the no_cuda gate, via the crash-safe subprocess probe.
     if vendor_for_device(device) is AcceleratorVendor.INTEL:
-        return probe_xpu_subprocess()
+        return probe_xpu_subprocess(index)
     if not torch.cuda.is_available():
         return False, "no_cuda"
-    if vendor_for_device(device) is AcceleratorVendor.AMD:
+    # The device string comes straight from --device; an out-of-range ordinal
+    # raises deep inside torch, so bound-check and guard instead of crashing.
+    count = torch.cuda.device_count()
+    if index >= count:
+        return False, f"device index {index} out of range (found {count} GPU(s))"
+    try:
+        if vendor_for_device(device) is AcceleratorVendor.AMD:
+            return True, torch.cuda.get_device_name(device)
+        capability = torch.cuda.get_device_capability(device)
+        if capability < MIN_GPU_COMPUTE:
+            return False, ("compute_too_low", capability[0], capability[1])
         return True, torch.cuda.get_device_name(device)
-    capability = torch.cuda.get_device_capability(device)
-    if capability < MIN_GPU_COMPUTE:
-        return False, ("compute_too_low", capability[0], capability[1])
-    return True, torch.cuda.get_device_name(device)
+    except Exception as e:
+        return False, f"GPU query failed for {device}: {e}"
 def _bundled_exe_filename(name: str) -> str:
     if os.name == "nt" and not name.lower().endswith(".exe"):
         return f"{name}.exe"

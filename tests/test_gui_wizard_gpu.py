@@ -5,7 +5,19 @@ import types
 
 import pytest
 
+# Bind jasna.accelerator to the real torch before any test installs a fake
+# sys.modules["torch"]: check_supported_gpu re-imports it lazily, and its
+# module-level torch reference must not capture the SimpleNamespace fake.
+import jasna.accelerator  # noqa: F401
 from jasna.gui.wizard import FirstRunWizard
+
+
+class _FakeTorchDevice:
+    """Minimal stand-in for torch.device: exposes .index parsed from the spec."""
+
+    def __init__(self, spec: str) -> None:
+        spec = str(spec)
+        self.index = int(spec.split(":", 1)[1]) if ":" in spec else None
 
 
 def _make_fake_torch(
@@ -20,11 +32,13 @@ def _make_fake_torch(
         return get_device_name
 
     return types.SimpleNamespace(
+        device=_FakeTorchDevice,
         cuda=types.SimpleNamespace(
             is_available=lambda: is_available,
+            device_count=lambda: 1,
             get_device_capability=_get_device_capability,
             get_device_name=_get_device_name,
-        )
+        ),
     )
 
 

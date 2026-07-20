@@ -4,6 +4,10 @@ import types
 
 import pytest
 
+# Import accelerator up front so its module-level `import torch` binds the real
+# torch; the check_supported_gpu tests fake sys.modules["torch"] and must not
+# leak that fake into a first-time jasna.accelerator import.
+from jasna import accelerator  # noqa: F401
 from jasna import os_utils
 
 
@@ -384,64 +388,185 @@ def test_check_sysmem_fallback_returns_na_on_non_windows(monkeypatch) -> None:
     assert info == "N/A"
 
 
-def test_check_supported_gpu_returns_name_when_available_and_compute_ok(monkeypatch) -> None:
-    import types
+class _FakeTorchDevice:
+    """Minimal torch.device stand-in: parses 'cuda:1' → type/index."""
 
-    fake_torch = types.SimpleNamespace(
+    def __init__(self, spec) -> None:
+        typ, _, idx = str(spec).partition(":")
+        self.type = typ
+        self.index = int(idx) if idx else None
+
+
+def _fake_cuda_torch(*, available=True, count=1, capability=(8, 0), name="RTX 4090"):
+    # capability/name accept a callable to simulate raising torch queries.
+    capability_fn = capability if callable(capability) else (lambda device: capability)
+    name_fn = name if callable(name) else (lambda device: name)
+    return types.SimpleNamespace(
+        device=_FakeTorchDevice,
         cuda=types.SimpleNamespace(
-            is_available=lambda: True,
-            get_device_capability=lambda device: (8, 0),
-            get_device_name=lambda device: "RTX 4090",
-        )
+            is_available=lambda: available,
+            device_count=lambda: count,
+            get_device_capability=capability_fn,
+            get_device_name=name_fn,
+        ),
     )
-    monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
+
+
+def test_check_supported_gpu_returns_name_when_available_and_compute_ok(monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "torch", _fake_cuda_torch())
     ok, result = os_utils.check_supported_gpu()
     assert ok is True
     assert result == "RTX 4090"
 
 
 def test_check_supported_gpu_returns_no_cuda_when_unavailable(monkeypatch) -> None:
-    import types
-
-    fake_torch = types.SimpleNamespace(
-        cuda=types.SimpleNamespace(is_available=lambda: False)
-    )
-    monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "torch", _fake_cuda_torch(available=False))
     ok, result = os_utils.check_supported_gpu()
     assert ok is False
     assert result == "no_cuda"
 
 
 def test_check_supported_gpu_returns_compute_too_low_when_below_min(monkeypatch) -> None:
-    import types
-
-    fake_torch = types.SimpleNamespace(
-        cuda=types.SimpleNamespace(
-            is_available=lambda: True,
-            get_device_capability=lambda device: (6, 1),
-            get_device_name=lambda device: "GTX 1060",
-        )
-    )
-    monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "torch", _fake_cuda_torch(capability=(6, 1), name="GTX 1060"))
     ok, result = os_utils.check_supported_gpu()
     assert ok is False
     assert result == ("compute_too_low", 6, 1)
 
 
 def test_check_supported_gpu_returns_ok_at_exactly_min_compute(monkeypatch) -> None:
-    import types
-
-    fake_torch = types.SimpleNamespace(
-        cuda=types.SimpleNamespace(
-            is_available=lambda: True,
-            get_device_capability=lambda device: (7, 5),
-            get_device_name=lambda device: "RTX 2070",
-        )
-    )
-    monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "torch", _fake_cuda_torch(capability=(7, 5), name="RTX 2070"))
     ok, result = os_utils.check_supported_gpu()
     assert ok is True
     assert result == "RTX 2070"
+
+
+def test_check_supported_gpu_out_of_range_cuda_index_returns_reason(monkeypatch) -> None:
+    # '--device cuda:2' on a single-GPU box must fail cleanly, not raise
+    # 'invalid device ordinal' out of main().
+    monkeypatch.setitem(sys.modules, "torch", _fake_cuda_torch(count=1))
+    ok, result = os_utils.check_supported_gpu("cuda:2")
+    assert ok is False
+    assert isinstance(result, str)
+    assert "out of range" in result
+
+
+def test_check_supported_gpu_returns_reason_when_torch_query_raises(monkeypatch) -> None:
+    def _raise(device):
+        raise RuntimeError("CUDA error: invalid device ordinal")
+
+    monkeypatch.setitem(sys.modules, "torch", _fake_cuda_torch(capability=_raise))
+    ok, result = os_utils.check_supported_gpu("cuda:0")
+    assert ok is False
+    assert isinstance(result, str)
+    assert "invalid device ordinal" in result
+
+
+def test_check_supported_gpu_amd_out_of_range_index_returns_reason(monkeypatch) -> None:
+    import torch as real_torch
+
+    # vendor_for_device reads the REAL torch bound in jasna.accelerator.
+    monkeypatch.setattr(real_torch.version, "hip", "6.2.41133", raising=False)
+    monkeypatch.setitem(sys.modules, "torch", _fake_cuda_torch(count=1))
+    ok, result = os_utils.check_supported_gpu("cuda:2")
+    assert ok is False
+    assert isinstance(result, str)
+    assert "out of range" in result
+
+
+def test_check_supported_gpu_amd_returns_reason_when_torch_query_raises(monkeypatch) -> None:
+    import torch as real_torch
+
+    def _raise(device):
+        raise RuntimeError("HIP error: invalid device ordinal")
+
+    monkeypatch.setattr(real_torch.version, "hip", "6.2.41133", raising=False)
+    monkeypatch.setitem(sys.modules, "torch", _fake_cuda_torch(name=_raise))
+    ok, result = os_utils.check_supported_gpu("cuda:0")
+    assert ok is False
+    assert isinstance(result, str)
+    assert "invalid device ordinal" in result
+
+
+def test_check_supported_gpu_intel_passes_parsed_index_to_probe(monkeypatch) -> None:
+    from jasna import accelerator
+
+    calls: list[int] = []
+
+    def fake_probe(index=0):
+        calls.append(index)
+        return True, f"Intel Arc {index}"
+
+    monkeypatch.setattr(accelerator, "probe_xpu_subprocess", fake_probe)
+
+    assert os_utils.check_supported_gpu("xpu:1") == (True, "Intel Arc 1")
+    assert os_utils.check_supported_gpu("xpu") == (True, "Intel Arc 0")
+    assert calls == [1, 0]
+
+
+@pytest.fixture
+def probe_cache_cleared():
+    from jasna import accelerator
+
+    accelerator.probe_xpu_subprocess.cache_clear()
+    yield
+    accelerator.probe_xpu_subprocess.cache_clear()
+
+
+def _fake_xpu_torch(*, available=True, count=2, name=lambda index: f"Arc {index}"):
+    return types.SimpleNamespace(
+        xpu=types.SimpleNamespace(
+            is_available=lambda: available,
+            device_count=lambda: count,
+            get_device_name=name,
+        )
+    )
+
+
+def test_probe_xpu_subprocess_cache_is_keyed_by_index(monkeypatch, probe_cache_cleared) -> None:
+    from jasna import accelerator
+
+    codes: list[str] = []
+
+    def fake_run(cmd, **kwargs):
+        codes.append(cmd[-1])
+        return types.SimpleNamespace(returncode=0, stdout="Arc probed\n", stderr="")
+
+    monkeypatch.setattr("jasna._frozen.is_frozen", lambda: False)
+    monkeypatch.setattr(accelerator.subprocess, "run", fake_run)
+
+    assert accelerator.probe_xpu_subprocess(0) == (True, "Arc probed")
+    assert accelerator.probe_xpu_subprocess(0) == (True, "Arc probed")
+    assert accelerator.probe_xpu_subprocess(1) == (True, "Arc probed")
+
+    # one subprocess per distinct index (cache hit for the repeat), each
+    # probing its own ordinal
+    assert len(codes) == 2
+    assert "get_device_name(0)" in codes[0]
+    assert "get_device_name(1)" in codes[1]
+
+
+def test_probe_xpu_subprocess_frozen_reports_get_device_name_failure(monkeypatch, probe_cache_cleared) -> None:
+    from jasna import accelerator
+
+    def _raise(index):
+        raise RuntimeError("Level-Zero enumeration failed")
+
+    monkeypatch.setattr("jasna._frozen.is_frozen", lambda: True)
+    monkeypatch.setattr(accelerator, "torch", _fake_xpu_torch(name=_raise))
+
+    ok, reason = accelerator.probe_xpu_subprocess(0)
+    assert ok is False
+    assert "Level-Zero enumeration failed" in reason
+
+
+def test_probe_xpu_subprocess_frozen_passes_index_and_bounds_checks(monkeypatch, probe_cache_cleared) -> None:
+    from jasna import accelerator
+
+    monkeypatch.setattr("jasna._frozen.is_frozen", lambda: True)
+    monkeypatch.setattr(accelerator, "torch", _fake_xpu_torch(count=2))
+
+    assert accelerator.probe_xpu_subprocess(1) == (True, "Arc 1")
+    assert accelerator.probe_xpu_subprocess(5) == (False, "xpu device index 5 out of range (found 2)")
 
 
 def test_nvidia_compatibility_alias_is_not_exposed() -> None:

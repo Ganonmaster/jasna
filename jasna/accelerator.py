@@ -242,40 +242,55 @@ def supports_nvvfx(device: torch.device | str | None = None) -> bool:
     return is_nvidia_device(device) and _module_available("nvvfx")
 
 
-_XPU_PROBE_CODE = (
-    "import torch, sys; "
-    "ok = getattr(torch, 'xpu', None) is not None and torch.xpu.is_available(); "
-    "print(torch.xpu.get_device_name(0) if ok else ''); "
-    "sys.exit(0 if ok else 1)"
-)
+# .format(index=...) template; {{count}} survives as an f-string brace pair.
+_XPU_PROBE_CODE = """\
+import sys
+import torch
+ok = getattr(torch, "xpu", None) is not None and torch.xpu.is_available()
+if not ok:
+    sys.exit(1)
+count = torch.xpu.device_count()
+if {index} >= count:
+    print(f"xpu device index {index} out of range (found {{count}})", file=sys.stderr)
+    sys.exit(1)
+print(torch.xpu.get_device_name({index}))
+"""
 
 
-@lru_cache(maxsize=1)
-def probe_xpu_subprocess() -> tuple[bool, str]:
+@lru_cache(maxsize=8)
+def probe_xpu_subprocess(index: int = 0) -> tuple[bool, str]:
     """Probe torch.xpu availability in a subprocess → (ok, name_or_reason).
 
     A subprocess is not paranoia: on broken driver stacks torch.xpu.is_available()
     can hard-crash the process (Lada #292), and on Battlemage the default
     Level-Zero backend can SIGABRT (intel/compute-runtime#922). On failure, retry
     via the OpenCL adapter; if that works, export ONEAPI_DEVICE_SELECTOR for this
-    process so all later xpu use inherits the working backend.
+    process so all later xpu use inherits the working backend. Results are
+    cached per device index.
     """
     from jasna._frozen import is_frozen
 
     if is_frozen():
         # Frozen builds cannot re-invoke a Python interpreter (sys.executable is
-        # the app binary); fall back to a guarded in-process check.
+        # the app binary); fall back to a guarded in-process check. Everything
+        # stays inside the try: get_device_name itself can raise on Level-Zero
+        # enumeration failures (the compute-runtime#922 class).
         try:
             ok = getattr(torch, "xpu", None) is not None and torch.xpu.is_available()
-        except Exception as exc:  # pragma: no cover - defensive
+            if not ok:
+                return False, "torch.xpu unavailable"
+            count = torch.xpu.device_count()
+            if index >= count:
+                return False, f"xpu device index {index} out of range (found {count})"
+            return True, torch.xpu.get_device_name(index)
+        except Exception as exc:
             return False, f"torch.xpu check failed: {exc}"
-        return (True, torch.xpu.get_device_name(0)) if ok else (False, "torch.xpu unavailable")
 
     def _run(extra_env: dict[str, str]) -> tuple[bool, str]:
         env = {**os.environ, **extra_env}
         try:
             result = subprocess.run(
-                [sys.executable, "-c", _XPU_PROBE_CODE],
+                [sys.executable, "-c", _XPU_PROBE_CODE.format(index=index)],
                 capture_output=True, text=True, timeout=120, env=env,
             )
         except (subprocess.TimeoutExpired, OSError) as exc:
