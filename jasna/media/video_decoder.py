@@ -11,6 +11,7 @@ from av.video.reformatter import ColorRange as AvColorRange, VideoReformatter
 from jasna.accelerator import (
     AcceleratorVendor,
     current_stream,
+    host_buffer,
     new_stream,
     stream_context,
     vendor_for_device,
@@ -26,6 +27,21 @@ _libcuda: ctypes.CDLL | None = None
 
 class VideoDecodeError(RuntimeError):
     pass
+
+
+class _HardwareDecodeInitError(Exception):
+    """Dedicated *_qsv/*_amf context failed before producing any frame.
+
+    qsvdec/AMF defer real session init until header packets arrive, so an
+    unsupported profile (H.264 High 4:4:4, 12-bit HEVC, ...) passes open()
+    and only fails per-packet. Zero frames decoded so far marks that
+    deferred-init failure — distinct from mid-stream corruption, which stays
+    subject to CORRUPT_PACKET_TOLERANCE — so the reader can retry in software.
+    """
+
+    def __init__(self, error: av.FFmpegError):
+        super().__init__(str(error))
+        self.error = error
 
 
 def _cuda_driver() -> ctypes.CDLL:
@@ -70,10 +86,14 @@ class NvidiaVideoReader:
         self.vendor = vendor_for_device(device)
         self._decoder_ctx = None
         self._amd_hardware_decode = False
+        self._hw_decoder = False
+        self._frames_decoded = False
 
     def __enter__(self):
         self._decoder_ctx = None
         self._amd_hardware_decode = False
+        self._hw_decoder = False
+        self._frames_decoded = False
         current_stream(self.device)
         # Serialize hardware codec init across pipeline threads (see codec_open_lock):
         # concurrent QSV/oneVPL avcodec_open2 deadlocks.
@@ -145,6 +165,7 @@ class NvidiaVideoReader:
             decoder.open(strict=False)
             self._decoder_ctx = decoder
             self._amd_hardware_decode = True
+            self._hw_decoder = True
             log.info("Using AMF hardware decoder %s for %s", decoder_name, self.file)
         except (ValueError, av.FFmpegError, RuntimeError) as exc:
             source_ctx.thread_type = "AUTO"
@@ -178,6 +199,7 @@ class NvidiaVideoReader:
             # so only options + extradata are needed before open().
             decoder.open(strict=False)
             self._decoder_ctx = decoder
+            self._hw_decoder = True
             log.info("Using QSV hardware decoder %s for %s", decoder_name, self.file)
         except (ValueError, av.FFmpegError, RuntimeError) as exc:
             source_ctx.thread_type = "AUTO"
@@ -198,6 +220,13 @@ class NvidiaVideoReader:
         if result != 0 and exc_type is None:
             raise RuntimeError(f"cuStreamDestroy failed (CUDA error {result})")
 
+    def _deferred_hw_init_failure(self) -> bool:
+        return (
+            getattr(self, "_decoder_ctx", None) is not None
+            and self._hw_decoder
+            and not self._frames_decoded
+        )
+
     def _decode_packet(self, packet, consecutive_errors: int) -> tuple[list, int]:
         try:
             frames = (
@@ -206,6 +235,8 @@ class NvidiaVideoReader:
                 else packet.decode()
             )
         except av.error.InvalidDataError as e:
+            if self._deferred_hw_init_failure():
+                raise _HardwareDecodeInitError(e) from e
             consecutive_errors += 1
             if consecutive_errors > CORRUPT_PACKET_TOLERANCE:
                 raise VideoDecodeError(
@@ -215,26 +246,84 @@ class NvidiaVideoReader:
             log.warning("Recovered video corruption in %s: %s", self.file, e)
             return [], consecutive_errors
         except av.FFmpegError as e:
+            if self._deferred_hw_init_failure():
+                raise _HardwareDecodeInitError(e) from e
             raise VideoDecodeError(f"Failed to decode {self.file}: {e}") from e
         if frames:
             consecutive_errors = 0
+            self._frames_decoded = True
         return frames, consecutive_errors
+
+    def _fall_back_to_software_decoder(self, error: Exception) -> None:
+        hw_name = getattr(self._decoder_ctx, "name", None) or "hardware decoder"
+        # Drop the hw context first (PyAV has no explicit close; freed on GC) so
+        # a failure opening the software context cannot leave it half-active.
+        self._decoder_ctx = None
+        self._hw_decoder = False
+        self._amd_hardware_decode = False
+        log.warning(
+            "%s produced no frames for %s (codec %s): %s; falling back to FFmpeg "
+            "software decoding",
+            hw_name,
+            self.file,
+            self.metadata.codec_name,
+            error,
+        )
+        source_ctx = self.video_stream.codec_context
+        try:
+            with codec_open_lock:
+                # Same constraint as the QSV copy-back context: hwaccel-less, so
+                # only options + extradata may be set before open().
+                decoder = av.CodecContext.create(str(source_ctx.name), "r")
+                if source_ctx.extradata:
+                    decoder.extradata = source_ctx.extradata
+                decoder.thread_type = "AUTO"
+                decoder.open(strict=False)
+        except (ValueError, av.FFmpegError, RuntimeError) as exc:
+            raise VideoDecodeError(
+                f"Failed to open software decoder for {self.file} after "
+                f"{hw_name} failure: {exc}"
+            ) from exc
+        self._decoder_ctx = decoder
+
+    def _position_at(self, seek_ts: float | None) -> int | None:
+        """Seek to seek_ts (file start when None) and flush the active decoder."""
+        start = resolve_video_start_pts(
+            self.video_stream.start_time,
+            self.metadata.start_pts,
+        )
+        target_pts = None
+        if seek_ts is not None:
+            target_pts = start + round(seek_ts / self.video_stream.time_base)
+        self.container.seek(
+            start if target_pts is None else target_pts,
+            stream=self.video_stream,
+            backward=True,
+        )
+        if self._decoder_ctx is not None:
+            self._decoder_ctx.flush_buffers()
+        return target_pts
 
     def _decoded_frames(self, seek_ts: float | None):
         target_pts = None
         if seek_ts is not None:
-            start = resolve_video_start_pts(
-                self.video_stream.start_time,
-                self.metadata.start_pts,
-            )
-            target_pts = start + round(seek_ts / self.video_stream.time_base)
-            self.container.seek(target_pts, stream=self.video_stream, backward=True)
-            if self._decoder_ctx is not None:
-                self._decoder_ctx.flush_buffers()
+            target_pts = self._position_at(seek_ts)
 
         consecutive_errors = 0
-        for packet in self.container.demux(self.video_stream):
-            frames, consecutive_errors = self._decode_packet(packet, consecutive_errors)
+        packets = self.container.demux(self.video_stream)
+        while True:
+            packet = next(packets, None)
+            if packet is None:
+                return
+            try:
+                frames, consecutive_errors = self._decode_packet(packet, consecutive_errors)
+            except _HardwareDecodeInitError as e:
+                # Deferred hw init failure: retry the whole stream in software.
+                self._fall_back_to_software_decoder(e.error)
+                target_pts = self._position_at(seek_ts)
+                consecutive_errors = 0
+                packets = self.container.demux(self.video_stream)
+                continue
             for frame in frames:
                 if target_pts is not None and frame.pts is not None and frame.pts < target_pts:
                     continue
@@ -363,7 +452,7 @@ class NvidiaVideoReader:
         # the fallback's extra memory: H2D copies and conversion kernels are
         # ordered on the same stream, so the next H2D overwrite of the staging
         # frame starts only after the prior conversion kernel consumed it.
-        pinned = torch.empty((self.batch_size, H + H // 2, W), dtype=dtype, pin_memory=True)
+        pinned = host_buffer((self.batch_size, H + H // 2, W), dtype, want_pinned=True)
         staging = torch.empty((H + H // 2, W), dtype=dtype, device=self.device)
         stream = new_stream(self.device)
 

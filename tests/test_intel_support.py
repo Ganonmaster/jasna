@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import errno
+import logging
+from contextlib import nullcontext
 from fractions import Fraction
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import av
 import pytest
 import torch
 from av.video.reformatter import Colorspace as AvColorspace, ColorRange as AvColorRange
@@ -235,3 +239,151 @@ def test_qsv_decoder_context_is_created(monkeypatch) -> None:
     assert decoder.extradata == b"header"
     assert decoder.opened_strict is False
     assert reader._decoder_ctx is decoder
+
+
+class _FakeContainer:
+    def __init__(self, packets):
+        self.packets = packets
+        self.seeks: list[int] = []
+
+    def demux(self, _stream):
+        return iter(self.packets)
+
+    def seek(self, pts, *, stream=None, backward=False):
+        self.seeks.append(pts)
+
+
+def _reader_with_hw_decoder(module, hw_decoder):
+    reader = module.NvidiaVideoReader(
+        "input.mp4",
+        4,
+        torch.device("xpu:0"),
+        _metadata(),
+    )
+    reader.container = _FakeContainer(
+        [SimpleNamespace(pts=0), SimpleNamespace(pts=1)]
+    )
+    reader.video_stream = SimpleNamespace(
+        start_time=0,
+        time_base=Fraction(1, 30),
+        codec_context=SimpleNamespace(name="h264", extradata=b"header"),
+    )
+    reader._decoder_ctx = hw_decoder
+    reader._hw_decoder = True
+    return reader
+
+
+def test_qsv_decoder_falls_back_to_software_when_hw_yields_no_frames(
+    monkeypatch, caplog
+) -> None:
+    # qsvdec defers real MFX init until header packets arrive: an unsupported
+    # profile passes open(strict=False) and then fails on EVERY packet. With
+    # zero frames produced the reader must swap in a software decoder, rewind,
+    # and re-decode transparently instead of aborting the job.
+    import jasna.media.video_decoder as module
+
+    hw = MagicMock()
+    hw.name = "h264_qsv"
+    hw.decode.side_effect = av.error.InvalidDataError(errno.EINVAL, "mfx init failed")
+    sw = MagicMock()
+    sw.decode.side_effect = lambda packet: [SimpleNamespace(pts=packet.pts)]
+    create = MagicMock(return_value=sw)
+    monkeypatch.setattr(module.av, "CodecContext", SimpleNamespace(create=create))
+
+    reader = _reader_with_hw_decoder(module, hw)
+    with caplog.at_level(logging.WARNING, logger=module.__name__):
+        frames = list(reader._decoded_frames(None))
+
+    assert [frame.pts for frame in frames] == [0, 1]
+    assert hw.decode.call_count == 1
+    # Software context built for the stream codec and rewound to the start.
+    assert create.call_args.args[:2] == ("h264", "r")
+    assert sw.extradata == b"header"
+    sw.open.assert_called_once_with(strict=False)
+    assert reader._decoder_ctx is sw
+    assert reader._hw_decoder is False
+    assert reader.container.seeks == [0]
+    assert "falling back to FFmpeg software decoding" in caplog.text
+
+
+def test_qsv_decoder_error_after_frames_stays_fatal(monkeypatch) -> None:
+    # Once the hw context has produced frames, a hard decode error is real
+    # mid-stream corruption: no software retry, the job must abort.
+    import jasna.media.video_decoder as module
+
+    hw = MagicMock()
+    hw.name = "h264_qsv"
+    hw.decode.side_effect = [
+        [SimpleNamespace(pts=0)],
+        av.FFmpegError(errno.EINVAL, "hard failure"),
+    ]
+    create = MagicMock()
+    monkeypatch.setattr(module.av, "CodecContext", SimpleNamespace(create=create))
+
+    reader = _reader_with_hw_decoder(module, hw)
+    with pytest.raises(module.VideoDecodeError, match="Failed to decode"):
+        list(reader._decoded_frames(None))
+    create.assert_not_called()
+    assert reader._decoder_ctx is hw
+
+
+class _FakePlane(bytearray):
+    line_size: int
+
+
+def _fake_software_frame(pts: int, height: int, width: int) -> SimpleNamespace:
+    y = _FakePlane(height * width)
+    y.line_size = width
+    uv = _FakePlane((height // 2) * width)
+    uv.line_size = width
+    return SimpleNamespace(
+        pts=pts,
+        planes=(y, uv),
+        format=SimpleNamespace(name="yuv420p", components=[SimpleNamespace(bits=8)]),
+    )
+
+
+def test_software_decode_survives_pinned_memory_failure(monkeypatch, caplog) -> None:
+    # xpu/ROCm route decode through _frames_software; when pinning fails (the
+    # reason accelerator.host_buffer exists) decode must continue on pageable
+    # buffers instead of crashing on a bare pin_memory=True allocation.
+    import jasna.media.video_decoder as module
+
+    real_empty = torch.empty
+    pin_attempts = []
+
+    def fake_empty(*args, **kwargs):
+        if kwargs.get("pin_memory"):
+            pin_attempts.append(args)
+            raise RuntimeError("pinned memory unavailable")
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", fake_empty)
+    monkeypatch.setattr(module, "YuvToRgbConverter", MagicMock())
+    monkeypatch.setattr(
+        module, "VideoReformatter", lambda: SimpleNamespace(reformat=lambda frame, **_: frame)
+    )
+    monkeypatch.setattr(module, "new_stream", lambda _device: MagicMock())
+    monkeypatch.setattr(module, "stream_context", lambda _stream: nullcontext())
+    monkeypatch.setattr(module, "vendor_for_device", lambda _device: AcceleratorVendor.INTEL)
+
+    reader = module.NvidiaVideoReader(
+        "input.mp4",
+        2,
+        torch.device("cpu"),
+        _metadata(),
+    )
+    reader.height = 16
+    reader.width = 16
+    reader._full_range = False
+
+    group = [_fake_software_frame(0, 16, 16), _fake_software_frame(1, 16, 16)]
+    with caplog.at_level(logging.WARNING, logger="jasna.accelerator"):
+        batches = list(reader._frames_software(iter(()), group))
+
+    assert pin_attempts, "expected a pinned allocation attempt"
+    assert "Pinned host memory unavailable" in caplog.text
+    assert len(batches) == 1
+    batch, pts = batches[0]
+    assert batch.shape == (2, 3, 16, 16)
+    assert pts == [0, 1]

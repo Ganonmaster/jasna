@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import errno
 import sys
 from fractions import Fraction
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import av
 import numpy as np
 import pytest
 import torch
@@ -186,6 +188,61 @@ def test_amf_decoder_context_is_created(monkeypatch) -> None:
     decoder.open.assert_called_once_with(strict=False)
     assert reader._decoder_ctx is decoder
     assert reader._amd_hardware_decode is True
+    assert reader._hw_decoder is True
+
+
+def test_amf_decoder_falls_back_to_software_when_hw_yields_no_frames(monkeypatch) -> None:
+    # AMF, like qsvdec, defers real session init until header packets arrive:
+    # an unsupported profile passes open(strict=False) and then fails on every
+    # packet. With zero frames produced the reader must swap in a software
+    # decoder, rewind, and re-decode instead of aborting the job.
+    import jasna.media.video_decoder as module
+
+    hw = MagicMock()
+    hw.name = "h264_amf"
+    hw.decode.side_effect = av.error.InvalidDataError(errno.EINVAL, "amf init failed")
+    sw = MagicMock()
+    sw.decode.side_effect = lambda packet: [SimpleNamespace(pts=packet.pts)]
+    create = MagicMock(return_value=sw)
+    monkeypatch.setattr(module.av, "CodecContext", SimpleNamespace(create=create))
+
+    class _FakeContainer:
+        def __init__(self, packets):
+            self.packets = packets
+            self.seeks: list[int] = []
+
+        def demux(self, _stream):
+            return iter(self.packets)
+
+        def seek(self, pts, *, stream=None, backward=False):
+            self.seeks.append(pts)
+
+    reader = module.NvidiaVideoReader(
+        "input.mp4",
+        4,
+        torch.device("cuda:0"),
+        _metadata(),
+    )
+    reader.container = _FakeContainer([SimpleNamespace(pts=0), SimpleNamespace(pts=1)])
+    reader.video_stream = SimpleNamespace(
+        start_time=0,
+        time_base=Fraction(1, 30),
+        codec_context=SimpleNamespace(name="h264", extradata=b"header"),
+    )
+    reader._decoder_ctx = hw
+    reader._hw_decoder = True
+    reader._amd_hardware_decode = True
+
+    frames = list(reader._decoded_frames(None))
+
+    assert [frame.pts for frame in frames] == [0, 1]
+    assert hw.decode.call_count == 1
+    assert create.call_args.args[:2] == ("h264", "r")
+    sw.open.assert_called_once_with(strict=False)
+    assert reader._decoder_ctx is sw
+    assert reader._hw_decoder is False
+    assert reader._amd_hardware_decode is False
+    assert reader.container.seeks == [0]
 
 
 def test_migraphx_runner_provider_and_tensor_bridge(monkeypatch, tmp_path) -> None:
