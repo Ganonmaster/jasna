@@ -5,7 +5,8 @@ from pathlib import Path
 from jasna.media.image_io import IMAGE_EXTENSIONS
 
 VIDEO_EXTENSIONS: frozenset[str] = frozenset(
-    {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm"}
+    {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm",
+     ".m2ts", ".ts", ".mpg", ".mpeg", ".m4v"}
 )
 MEDIA_EXTENSIONS: frozenset[str] = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 

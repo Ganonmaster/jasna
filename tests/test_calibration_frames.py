@@ -25,6 +25,7 @@ from jasna.calibration_frames import (
     main,
     select_calibration_set,
 )
+from jasna.media.media_files import VIDEO_EXTENSIONS
 
 
 def _candidate(video="v.mp4", ts=0.0, score=0.9, **kw) -> Candidate:
@@ -108,6 +109,23 @@ def test_probe_timestamps_interior_and_bounded():
     assert len(ts) == 48
     assert 0 < ts[0] < ts[-1] < 3600.0
     assert len(_probe_timestamps(120.0, cap=48)) == 12  # floor
+
+
+def test_iter_videos_uses_canonical_extension_set(tmp_path):
+    # The old private extension list here missed .flv/.webm even though the
+    # main input path and GUI drop-filter accept them, silently skewing the
+    # calibration sample. _iter_videos only looks at suffixes, so empty files
+    # are enough.
+    for name in ("a.flv", "b.webm", "c.m2ts", "d.TS", "e.mp4", "notes.txt", "f.png"):
+        (tmp_path / name).write_bytes(b"")
+    found = {p.name for p in _iter_videos([tmp_path])}
+    assert found == {"a.flv", "b.webm", "c.m2ts", "d.TS", "e.mp4"}
+    # A root that is itself a video file is taken as-is.
+    assert _iter_videos([tmp_path / "b.webm"]) == [tmp_path / "b.webm"]
+    # Canonical set covers the union of the old media list and the extra
+    # containers the calibration extractor used to carry privately.
+    assert {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm",
+            ".m2ts", ".ts", ".mpg", ".mpeg", ".m4v"} <= VIDEO_EXTENSIONS
 
 
 def test_frame_features_ranges():

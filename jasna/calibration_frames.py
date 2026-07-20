@@ -47,9 +47,10 @@ import av
 import numpy as np
 import torch
 
+from jasna.media.media_files import is_video
+
 logger = logging.getLogger("jasna.calibration_frames")
 
-VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".wmv", ".mov", ".m2ts", ".ts", ".mpg", ".mpeg", ".m4v"}
 SCAN_MASK_HW = (72, 128)
 PROBE_BATCH = 16
 HIGH_CONF = 0.55
@@ -76,11 +77,11 @@ class Candidate:
 def _iter_videos(roots: list[Path]) -> list[Path]:
     videos: list[Path] = []
     for root in roots:
-        if root.is_file() and root.suffix.lower() in VIDEO_EXTENSIONS:
+        if root.is_file() and is_video(root):
             videos.append(root)
             continue
         for p in sorted(root.rglob("*")):
-            if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS:
+            if p.is_file() and is_video(p):
                 videos.append(p)
     return videos
 
