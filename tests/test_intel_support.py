@@ -359,6 +359,39 @@ def test_qsv_decoder_drops_edit_list_preroll_frames() -> None:
     assert [frame.pts for frame in frames] == [0, 1]
 
 
+def test_qsv_decoder_drops_preroll_frames_with_mangled_pts() -> None:
+    # Field failure (ABF-358): qsvdec round-trips packet pts through the
+    # unsigned mfx TimeStamp, where negative edit-list pre-roll values wrap to
+    # ~2**64 and lose their low bits to double precision in the oneVPL runtime
+    # — the decoded frames come back with pts values (2048-multiples like
+    # -22528) that match NO flagged packet, so exact-pts joining alone leaks
+    # them. Any frame still before the presentation start while flagged
+    # packets are pending must be dropped too.
+    import jasna.media.video_decoder as module
+
+    hw = MagicMock()
+    hw.name = "h264_qsv"
+    hw.decode.side_effect = [
+        [],
+        [SimpleNamespace(pts=-36352)],  # mangled: packet said -36036
+        [SimpleNamespace(pts=-22528), SimpleNamespace(pts=0)],  # packet said -21021
+        [SimpleNamespace(pts=3003)],
+    ]
+
+    reader = _reader_with_hw_decoder(module, hw)
+    reader.container = _FakeContainer(
+        [
+            SimpleNamespace(pts=-36036, is_discard=True),
+            SimpleNamespace(pts=-21021, is_discard=True),
+            SimpleNamespace(pts=0, is_discard=False),
+            SimpleNamespace(pts=3003, is_discard=False),
+        ]
+    )
+
+    frames = list(reader._decoded_frames(None))
+    assert [frame.pts for frame in frames] == [0, 3003]
+
+
 def test_discard_tracking_only_applies_to_dedicated_hw_contexts() -> None:
     # Native/software decoders already honor AV_PKT_FLAG_DISCARD in decode.c;
     # the reader must not second-guess them.

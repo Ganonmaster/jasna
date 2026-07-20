@@ -315,8 +315,20 @@ class NvidiaVideoReader:
         # dedicated qsv/amf contexts have no discard handling, and a leaked
         # negative-pts frame corrupts QSV encoding downstream (oneVPL
         # timestamps are unsigned). Track flagged packets by pts and drop the
-        # matching decoded frames ourselves.
+        # matching decoded frames ourselves. The pts join is best-effort:
+        # qsvdec round-trips pts through the unsigned mfx timestamp, where a
+        # negative value wraps to ~2**64 and loses its low bits to double
+        # precision inside the runtime, so pre-roll frames can come back with
+        # a pts (e.g. -22528, a 2048-multiple) matching no packet — while
+        # flagged packets are pending, any frame still before the presentation
+        # start is such mangled pre-roll.
         discard_pts: set[int] = set()
+        preroll_dropped = 0
+        preroll_done = False
+        start_pts = resolve_video_start_pts(
+            self.video_stream.start_time,
+            self.metadata.start_pts,
+        )
         packets = self.container.demux(self.video_stream)
         while True:
             packet = next(packets, None)
@@ -336,12 +348,27 @@ class NvidiaVideoReader:
                 target_pts = self._position_at(seek_ts)
                 consecutive_errors = 0
                 discard_pts.clear()
+                preroll_dropped = 0
+                preroll_done = False
                 packets = self.container.demux(self.video_stream)
                 continue
             for frame in frames:
-                if frame.pts is not None and frame.pts in discard_pts:
-                    discard_pts.discard(frame.pts)
-                    continue
+                if frame.pts is not None and discard_pts:
+                    if frame.pts in discard_pts:
+                        discard_pts.discard(frame.pts)
+                        preroll_dropped += 1
+                        continue
+                    if not preroll_done and frame.pts < start_pts:
+                        preroll_dropped += 1
+                        continue
+                if not preroll_done:
+                    preroll_done = True
+                    if preroll_dropped:
+                        log.info(
+                            "Dropped %d edit-list pre-roll frame(s) from %s",
+                            preroll_dropped,
+                            self.file,
+                        )
                 if target_pts is not None and frame.pts is not None and frame.pts < target_pts:
                     continue
                 target_pts = None
