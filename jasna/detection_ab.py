@@ -71,7 +71,29 @@ def greedy_match(iou: np.ndarray, threshold: float = MATCH_IOU) -> list[tuple[in
         iou[:, idx[1]] = -1.0
 
 
+def _resample_bool_mask(mask: torch.Tensor, shape: tuple[int, int]) -> torch.Tensor:
+    import torch.nn.functional as F
+
+    return (
+        F.interpolate(
+            mask[None, None].float(), size=shape,
+            mode="bilinear", align_corners=False,
+        )[0, 0]
+        > 0.5
+    )
+
+
 def mask_iou(mask_a: torch.Tensor, mask_b: torch.Tensor) -> float:
+    if mask_a.shape != mask_b.shape:
+        # Model families use different mask grids (RF-DETR: a square head
+        # resolution over the aspect-stretched frame; YOLO: aspect-scaled to a
+        # max side). Both grids cover the full frame extent, so resampling one
+        # onto the other's grid aligns them in frame space — upsample the
+        # coarser mask for fidelity.
+        if mask_a.numel() < mask_b.numel():
+            mask_a = _resample_bool_mask(mask_a, tuple(mask_b.shape))
+        else:
+            mask_b = _resample_bool_mask(mask_b, tuple(mask_a.shape))
     inter = (mask_a & mask_b).sum().item()
     union = (mask_a | mask_b).sum().item()
     return inter / union if union else 1.0

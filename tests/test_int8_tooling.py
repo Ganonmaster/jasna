@@ -119,6 +119,25 @@ def test_mask_iou():
                     torch.zeros(4, 4, dtype=torch.bool)) == 1.0
 
 
+def test_mask_iou_across_different_grids():
+    """Cross-family comparison: RF-DETR masks are square (e.g. 192x192 over the
+    stretched frame) while YOLO's are aspect-scaled (e.g. 144x256) — same frame
+    extent, different grids. IoU must align them instead of crashing."""
+    # Upper half of the frame in a coarse square grid vs a finer wide grid.
+    a = torch.zeros(8, 8, dtype=torch.bool)
+    a[:4] = True
+    b = torch.zeros(9, 16, dtype=torch.bool)
+    b[: 4 * 9 // 8 + 1] = True  # ~upper half on the finer grid
+    iou = mask_iou(a, b)
+    assert 0.8 < iou <= 1.0, iou
+    # Disjoint halves stay near zero regardless of grid mismatch.
+    c = torch.zeros(9, 16, dtype=torch.bool)
+    c[5:] = True
+    assert mask_iou(a, c) < 0.2
+    # Same-grid fast path is untouched (no resample when shapes match).
+    assert mask_iou(a, a.clone()) == 1.0
+
+
 def test_compare_frame_counts_misses_and_blindness():
     stats = StratumStats()
     boxes_a = np.array([[0, 0, 10, 10], [50, 50, 60, 60]], dtype=np.float64)
