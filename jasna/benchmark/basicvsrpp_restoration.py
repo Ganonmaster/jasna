@@ -5,7 +5,6 @@ import time
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 
 from jasna.accelerator import is_nvidia_device, synchronize
 
@@ -32,8 +31,12 @@ def _timed(label: str, fn, *args, **kwargs):
 
 
 def _profile_split_forward(split: "BasicVSRPlusPlusNetSplit", device: torch.device, dtype: torch.dtype) -> None:
-    from jasna.restorer.basicvsrpp_sub_engines import BasicVSRPlusPlusNetSplit
-
+    """Per-stage timings mirroring BasicVSRPlusPlusNetSplit.forward() with the
+    CURRENT engine structure: the fused preprocess engine (feat_extract +
+    bicubic downsample + bidirectional SPyNet), per-direction flow precompute,
+    the four propagate passes (loop-body engines), and the upsample engine.
+    Stages call the split's real methods rather than re-implementing them, so
+    a future engine refactor breaks this loudly instead of drifting."""
     T = CLIP_LENGTH
     lqs = torch.randn(1, T, 3, SIZE, SIZE, device=device, dtype=dtype)
 
@@ -44,107 +47,52 @@ def _profile_split_forward(split: "BasicVSRPlusPlusNetSplit", device: torch.devi
     print(f"\n=== Profiling BasicVSRPlusPlusNetSplit (T={T}) ===")
     n, t, c, h, w = lqs.size()
 
+    # Stage 1: fused preprocess engine. T=60 >= the engine's min batch, so
+    # forward()'s short-clip padding branch never triggers here.
     lqs_flat = lqs.view(-1, c, h, w)
-    feats_ = _timed("feat_extract (TRT)", split._feat_extract_engine, lqs_flat)
+    feats_, flows_fwd, flows_bwd = _timed(
+        "preprocess (TRT, fused)", split._preprocess_engine, lqs_flat
+    )
     h_f, w_f = feats_.shape[2:]
+
     feats_ = feats_.view(n, t, -1, h_f, w_f)
+    feats: dict[str, list[torch.Tensor]] = {
+        "spatial": [feats_[:, i, :, :, :] for i in range(t)]
+    }
+    flows_forward = flows_fwd.view(n, t - 1, 2, h // 4, w // 4)
+    flows_backward = flows_bwd.view(n, t - 1, 2, h // 4, w // 4)
 
-    lqs_ds = _timed("downsample (bicubic)", lambda: F.interpolate(
-        lqs.view(-1, c, h, w), scale_factor=0.25, mode="bicubic"
-    ).view(n, t, c, h // 4, w // 4))
+    grid = split._make_identity_grid(h_f, w_f, lqs.device, lqs.dtype)
 
-    flows_fwd, flows_bwd = _timed("compute_flow (SPyNet)", split.compute_flow, lqs_ds)
+    # Stage 2: per-direction flow precompute (accumulated flows + grids).
+    flow_data: dict[str, tuple] = {}
+    synchronize()
+    tp0 = time.perf_counter()
+    for direction in ["backward", "forward"]:
+        flows = flows_backward if direction == "backward" else flows_forward
+        flow_data[direction] = split._precompute_flow_data(flows, direction, grid)
+    synchronize()
+    print(f"  {'flow precompute':30s} {(time.perf_counter() - tp0)*1000:8.1f} ms")
 
-    feats: dict[str, list[torch.Tensor]] = {"spatial": [feats_[:, i, :, :, :] for i in range(t)]}
-
-    total_loop_body = 0.0
-    total_precompute = 0.0
-
-    grid = BasicVSRPlusPlusNetSplit._make_identity_grid(h_f, w_f, device, dtype)
-
+    # Stage 3: the four propagation passes (loop-body TRT engines + the
+    # first-frame eager backbone call inside each).
+    total_propagate = 0.0
     for iter_ in [1, 2]:
         for direction in ["backward", "forward"]:
-            module_name = f"{direction}_{iter_}"
-            feats[module_name] = []
-            flows = flows_bwd if direction == "backward" else flows_fwd
-
-            n2, t2, _, h2, w2 = flows.size()
-            mid = split.mid_channels
-            frame_idx = list(range(0, t2 + 1))
-            flow_idx = list(range(-1, t2))
-            mapping_idx = list(range(0, len(feats["spatial"])))
-            mapping_idx += mapping_idx[::-1]
-            if "backward" in module_name:
-                frame_idx = frame_idx[::-1]
-                flow_idx = frame_idx
-
+            module = f"{direction}_{iter_}"
+            feats[module] = []
+            flows = flows_backward if direction == "backward" else flows_forward
+            fi, fli, af, fg, ag = flow_data[direction]
             synchronize()
-            tp0 = time.perf_counter()
-            acc_flows = split._precompute_accumulated_flows(
-                flows, flow_idx, len(frame_idx), grid,
-            )
-            scale_x = 2.0 / max(w2 - 1, 1)
-            scale_y = 2.0 / max(h2 - 1, 1)
-            flows_grid = flows.permute(0, 1, 3, 4, 2).contiguous()
-            flows_grid[..., 0].mul_(scale_x)
-            flows_grid[..., 1].mul_(scale_y)
-            flows_grid.add_(grid.unsqueeze(1))
-            acc_grids: dict[int, torch.Tensor] = {}
-            if acc_flows:
-                acc_keys = sorted(acc_flows.keys())
-                acc_batch = torch.cat([acc_flows[k] for k in acc_keys], dim=0)
-                acc_nhwc = acc_batch.permute(0, 2, 3, 1).contiguous()
-                acc_nhwc[..., 0].mul_(scale_x)
-                acc_nhwc[..., 1].mul_(scale_y)
-                acc_nhwc.add_(grid)
-                acc_grids = {k: acc_nhwc[j : j + 1] for j, k in enumerate(acc_keys)}
+            t0 = time.perf_counter()
+            feats = split.propagate(feats, flows, module, grid, fi, fli, af, fg, ag)
             synchronize()
-            total_precompute += time.perf_counter() - tp0
+            dt = time.perf_counter() - t0
+            total_propagate += dt
+            print(f"  {f'propagate {module} (TRT)':30s} {dt*1000:8.1f} ms")
+    print(f"  {'propagate total':30s} {total_propagate*1000:8.1f} ms")
 
-            lbe = split._loop_body_engines[module_name]
-            backbone_pt = split.backbone[module_name]
-            other_keys = [k for k in feats if k not in ["spatial", module_name]]
-
-            zero_feat = flows.new_zeros(n2, mid, h2, w2)
-            zero_flow = flows.new_zeros(n2, 2, h2, w2)
-
-            feat_prop = flows.new_zeros(n2, mid, h2, w2)
-
-            for i, idx in enumerate(frame_idx):
-                feat_current = feats["spatial"][mapping_idx[idx]]
-                backbone_prefix = torch.cat(
-                    [feat_current] + [feats[k][idx] for k in other_keys],
-                    dim=1,
-                )
-                if i > 0:
-                    flow_n1 = flows[:, flow_idx[i], :, :, :]
-                    g_n1 = flows_grid[:, flow_idx[i]]
-
-                    if i > 1:
-                        feat_n2 = feats[module_name][-2]
-                        flow_n2 = acc_flows[i]
-                        g_n2 = acc_grids[i]
-                    else:
-                        feat_n2 = zero_feat
-                        flow_n2 = zero_flow
-                        g_n2 = grid
-
-                    synchronize()
-                    tlb0 = time.perf_counter()
-                    feat_prop = lbe(feat_prop, g_n1, feat_n2, g_n2, feat_current, flow_n1, flow_n2, backbone_prefix)
-                    synchronize()
-                    total_loop_body += time.perf_counter() - tlb0
-                else:
-                    feat = torch.cat([backbone_prefix, feat_prop], dim=1)
-                    feat_prop = feat_prop + backbone_pt(feat)
-                feats[module_name].append(feat_prop)
-
-            if "backward" in module_name:
-                feats[module_name] = feats[module_name][::-1]
-
-    print(f"  {'propagate/precompute_all':30s} {total_precompute*1000:8.1f} ms")
-    print(f"  {'propagate/loop_body (TRT)':30s} {total_loop_body*1000:8.1f} ms")
-
+    # Stage 4: upsample engine (consumes the feats dict like forward() does).
     _timed("upsample (TRT)", split.upsample, lqs, feats)
 
     durations: list[float] = []
