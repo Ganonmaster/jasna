@@ -13,7 +13,9 @@ detection model this is a few MB per batch — negligible next to inference.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+from functools import lru_cache
 from pathlib import Path
 
 import torch
@@ -51,12 +53,41 @@ def _ov_target(device: torch.device) -> str:
     return "GPU" if is_intel_device(device) else "CPU"
 
 
+def _model_digest(path: Path) -> str:
+    """Truncated sha256 of the model bytes (same convention as
+    ``migraphx_runner._model_digest``). An OpenVINO IR (.xml) keeps its weights
+    in a sidecar .bin that re-quantization can rewrite without touching the
+    .xml, so the sidecar is folded into the digest when present."""
+    resolved = Path(path).resolve()
+    stat = resolved.stat()
+    digest = _cached_file_digest(str(resolved), stat.st_size, stat.st_mtime_ns)
+    sidecar = resolved.with_suffix(".bin")
+    if resolved.suffix.lower() == ".xml" and sidecar.is_file():
+        sidecar_stat = sidecar.stat()
+        combined = digest + _cached_file_digest(
+            str(sidecar), sidecar_stat.st_size, sidecar_stat.st_mtime_ns
+        )
+        digest = hashlib.sha256(combined.encode()).hexdigest()[:16]
+    return digest
+
+
+@lru_cache(maxsize=16)
+def _cached_file_digest(path: str, _size: int, _mtime_ns: int) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as model:
+        while chunk := model.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()[:16]
+
+
 def ov_cache_dir(onnx_path: Path, device: torch.device, *, fp16: bool) -> Path:
     """Compiled-blob cache directory for this model+precision+target (mirrors
-    ``migraphx_cache_dir``). OpenVINO keys blobs by model+device internally, so
-    the directory only needs to separate precision and GPU-vs-CPU targets."""
+    ``migraphx_cache_dir``). OpenVINO hashes the model internally so a stale
+    directory never loads the wrong blob, but the content digest keeps
+    ``ov_cache_is_ready`` honest after the model file is re-exported."""
     precision = "fp16" if fp16 else "fp32"
-    key = f"{precision}-{_ov_target(device).lower()}"
+    # Pre-digest dirs (plain "{precision}-{target}") become orphans; no cleanup.
+    key = f"{_model_digest(Path(onnx_path))}-{precision}-{_ov_target(device).lower()}"
     return Path(onnx_path).parent / f"{Path(onnx_path).stem}.openvino" / key
 
 
