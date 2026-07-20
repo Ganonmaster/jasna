@@ -112,9 +112,12 @@ def run_benchmark_cli(args: Namespace) -> None:
     if not gpu_ok:
         if gpu_result == "no_cuda":
             print("Error: No compatible GPU was found for this Jasna build.")
-        else:
+        elif isinstance(gpu_result, tuple) and gpu_result[0] == "compute_too_low":
             _, major, minor = gpu_result
             print(f"Error: Compute capability 7.5+ required (GPU: {major}.{minor}).")
+        else:
+            # Vendor probes (e.g. torch.xpu) return a free-form diagnostic string.
+            print(f"Error: {gpu_result}")
         sys.exit(1)
     benchmark_videos = (
         [Path(p) for p in args.benchmark_video] if args.benchmark_video else BENCHMARK_VIDEO_DEFAULTS

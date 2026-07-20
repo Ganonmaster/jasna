@@ -7,8 +7,12 @@ import subprocess
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import av
+
+if TYPE_CHECKING:
+    import torch
 
 from jasna.media import VideoMetadata, resolve_video_start_pts
 from jasna.media.audio_utils import needs_audio_reencode
@@ -86,7 +90,18 @@ def validate_smart_render(
     output_path: str | Path,
     codec: str,
     retarget_high_fps: bool = False,
+    device: torch.device | None = None,
 ) -> str:
+    # Vendor gate first: fragments are encoded with NvidiaVideoEncoder in
+    # smart_fragment mode, which is NVENC-only. None skips the check for
+    # callers that validate before a device is resolved.
+    if device is not None:
+        from jasna.accelerator import is_nvidia_device
+
+        if not is_nvidia_device(device):
+            raise SmartRenderCompatibilityError(
+                "Smart rendering is currently supported only with NVENC"
+            )
     input_codec = _canonical_codec(metadata.codec_name)
     output_codec = _canonical_codec(codec)
     if input_codec not in SUPPORTED_SMART_CODECS:

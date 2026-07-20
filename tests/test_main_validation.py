@@ -60,6 +60,20 @@ class TestMainValidation:
         assert pipeline_cls.call_args.kwargs["segments"] == (SegmentRange(1, 2),)
         assert pipeline_cls.call_args.kwargs["splice_plan"] is splice_plan
 
+    def test_segments_rejected_upfront_on_non_nvidia_device(self, tmp_path, capsys):
+        metadata = MagicMock(codec_name="h264", duration=10.0)
+        with (
+            patch("jasna.media.get_video_meta_data", return_value=metadata),
+            patch("jasna.media.splice.probe_keyframes") as probe,
+            patch("jasna.pipeline.NvidiaVideoEncoder") as encoder_cls,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _run_main_with_args(tmp_path, ["--segments", "1-2", "--device", "xpu"])
+        assert exc.value.code == 2
+        assert "only with NVENC" in capsys.readouterr().err
+        probe.assert_not_called()
+        encoder_cls.assert_not_called()
+
     def test_segments_reject_explicit_codec_mismatch(self, tmp_path):
         metadata = MagicMock(codec_name="h264", duration=10.0)
         with patch("jasna.media.get_video_meta_data", return_value=metadata):
@@ -138,14 +152,14 @@ class TestMainValidation:
                     main()
                 assert exc.value.code == 1
 
-    def test_low_compute_capability_exits(self, tmp_path):
+    def test_low_compute_capability_exits(self, tmp_path, capsys):
         input_path = tmp_path / "in.mp4"
         input_path.touch()
         output_path = tmp_path / "out.mkv"
 
         with (
             patch("jasna.main.check_ascii_install_path", return_value=(True, "C:\\fake")),
-            patch("jasna.main.check_supported_gpu", return_value=(False, ("GPU", 5, 0))),
+            patch("jasna.main.check_supported_gpu", return_value=(False, ("compute_too_low", 5, 0))),
             patch("jasna.main.check_required_executables"),            patch("jasna.main.check_windows_nvidia_sysmem_fallback_policy", return_value=(True, "OK")),
         ):
             with patch.object(sys, "argv", [
@@ -155,6 +169,27 @@ class TestMainValidation:
                 with pytest.raises(SystemExit) as exc:
                     main()
                 assert exc.value.code == 1
+        assert "Compute capability 7.5+ required (GPU: 5.0)" in capsys.readouterr().out
+
+    def test_gpu_probe_reason_string_exits(self, tmp_path, capsys):
+        input_path = tmp_path / "in.mp4"
+        input_path.touch()
+        output_path = tmp_path / "out.mkv"
+
+        reason = "xpu probe failed to run: Level-Zero backend crashed"
+        with (
+            patch("jasna.main.check_ascii_install_path", return_value=(True, "C:\\fake")),
+            patch("jasna.main.check_supported_gpu", return_value=(False, reason)),
+            patch("jasna.main.check_required_executables"),            patch("jasna.main.check_windows_nvidia_sysmem_fallback_policy", return_value=(True, "OK")),
+        ):
+            with patch.object(sys, "argv", [
+                "jasna", "--input", str(input_path), "--output", str(output_path),
+            ]):
+                from jasna.main import main
+                with pytest.raises(SystemExit) as exc:
+                    main()
+                assert exc.value.code == 1
+        assert reason in capsys.readouterr().out
 
     def test_valid_args_succeed(self, tmp_path):
         _run_main_with_args(tmp_path, [])

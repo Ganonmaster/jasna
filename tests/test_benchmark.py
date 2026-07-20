@@ -26,6 +26,37 @@ def test_benchmark_mode_runs_benchmark_cli() -> None:
         assert passed_args.detection_score_threshold == 0.5
 
 
+def test_benchmark_cli_prints_probe_reason_and_exits(capsys) -> None:
+    from argparse import Namespace
+
+    from jasna.benchmark import run_benchmark_cli
+
+    reason = "xpu probe failed to run: Level-Zero backend crashed"
+    with (
+        patch("jasna.benchmark.check_required_executables"),
+        patch("jasna.benchmark.check_supported_gpu", return_value=(False, reason)),
+    ):
+        with pytest.raises(SystemExit) as exc:
+            run_benchmark_cli(Namespace(device="xpu"))
+    assert exc.value.code == 1
+    assert reason in capsys.readouterr().out
+
+
+def test_benchmark_cli_reports_low_compute_capability(capsys) -> None:
+    from argparse import Namespace
+
+    from jasna.benchmark import run_benchmark_cli
+
+    with (
+        patch("jasna.benchmark.check_required_executables"),
+        patch("jasna.benchmark.check_supported_gpu", return_value=(False, ("compute_too_low", 5, 0))),
+    ):
+        with pytest.raises(SystemExit) as exc:
+            run_benchmark_cli(Namespace(device="cuda:0"))
+    assert exc.value.code == 1
+    assert "Compute capability 7.5+ required (GPU: 5.0)" in capsys.readouterr().out
+
+
 def test_benchmark_rfdetr_detection_speed_file_not_found() -> None:
     from jasna.benchmark.rfdetr_detection_speed import _run_single
 

@@ -92,6 +92,7 @@ def test_smart_run_rejects_precomputed_plan_for_different_segments() -> None:
     pipeline.input_video = Path("input.mp4")
     pipeline.output_video = Path("output.mp4")
     pipeline.codec = "h264"
+    pipeline.device = torch.device("cuda:0")
     pipeline.retarget_high_fps = False
     pipeline.segments = (SegmentRange(1, 2),)
     pipeline.splice_plan = SplicePlan(

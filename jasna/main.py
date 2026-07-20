@@ -418,9 +418,12 @@ def main() -> None:
     if not gpu_ok:
         if gpu_result == "no_cuda":
             print("Error: No compatible GPU was found for this Jasna build.")
-        else:
+        elif isinstance(gpu_result, tuple) and gpu_result[0] == "compute_too_low":
             _, major, minor = gpu_result
             print(f"Error: Compute capability 7.5+ required (GPU: {major}.{minor}).")
+        else:
+            # Vendor probes (e.g. torch.xpu) return a free-form diagnostic string.
+            print(f"Error: {gpu_result}")
         sys.exit(1)
 
     driver_ok, driver_info = check_gpu_driver_version()
@@ -550,6 +553,8 @@ def main() -> None:
     if not restoration_model_path.exists():
         raise FileNotFoundError(str(restoration_model_path))
 
+    device = torch.device(str(args.device))
+
     segments = None
     splice_plan = None
     codec = str(args.codec).lower()
@@ -584,6 +589,7 @@ def main() -> None:
                 output_path=output_video,
                 codec=codec,
                 retarget_high_fps=bool(args.retarget_high_fps),
+                device=device,
             )
             splice_plan = build_splice_plan(
                 segments,
@@ -613,7 +619,6 @@ def main() -> None:
     if temporal_overlap > 0 and (2 * temporal_overlap) >= max_clip_size:
         raise ValueError("--temporal-overlap must satisfy 2*--temporal-overlap < --max-clip-size")
 
-    device = torch.device(str(args.device))
     from jasna.accelerator import device_context, is_nvidia_device, vendor_for_device
 
     fp16 = bool(args.fp16)

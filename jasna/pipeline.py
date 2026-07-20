@@ -564,6 +564,7 @@ class Pipeline:
             output_path=self.output_video,
             codec=self.codec,
             retarget_high_fps=self.retarget_high_fps,
+            device=self.device,
         )
         if self.splice_plan is None:
             index = probe_keyframes(self.input_video, metadata)
