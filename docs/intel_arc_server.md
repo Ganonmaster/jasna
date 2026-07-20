@@ -8,7 +8,7 @@ runbook for a headless Linux server.
 Scope of Intel support (as of the initial port):
 - CLI batch export (`jasna --input … --output …`) and streaming (`--stream`).
 - Detection: RF-DETR (via OpenVINO GPU) and YOLO models (eager PyTorch on xpu).
-- Restoration: BasicVSR++ in eager PyTorch (fp32 — see the deform-conv note below).
+- Restoration: BasicVSR++ in eager PyTorch (fp16 by default — see the deform-conv note below).
 - Not available on Intel: the GUI, and `--secondary-restoration` of any kind.
   As on the AMD build, secondary restoration is gated to NVIDIA for now —
   `rtx-super-res` (Nvidia Maxine SDK) and `unet-4x` (TensorRT) have no Intel
@@ -226,9 +226,9 @@ detection via OpenVINO are not the bottleneck; restoration is.
 | Stage | Backend |
 |---|---|
 | Decode | `*_qsv` copy-back decoders → pinned host buffer → xpu upload → torch YUV→RGB |
-| Detection (RF-DETR) | OpenVINO GPU plugin, fp16 hint, blob cache in `<model>.openvino/<precision>-<target>/` next to the ONNX |
+| Detection (RF-DETR) | OpenVINO GPU plugin, fp16 hint, blob cache in `<model>.openvino/<digest>-<precision>-<target>/` next to the ONNX |
 | Detection (YOLO) | ultralytics eager PyTorch on xpu |
-| Restoration (BasicVSR++) | eager PyTorch on xpu (deform via native grid_sample composition; fp32 default, `--fp16` opt-in) |
+| Restoration (BasicVSR++) | eager PyTorch on xpu (deform via native grid_sample composition; fp16 default, `--no-fp16` for fp32) |
 | Blend / VR180 / color / LUT | torch ops on xpu |
 | Encode | `*_qsv` (nv12/p010le system-memory frames); no software-encode fallback (raises if QSV is missing) |
 | VRAM offloading | `torch.xpu.mem_get_info`-driven, same spill logic as CUDA |
