@@ -14,7 +14,8 @@ import torch
 from av.video.reformatter import Colorspace as AvColorspace, ColorRange as AvColorRange
 
 import jasna.media.video_encoder as video_encoder_module
-from jasna.media import VideoMetadata
+from jasna.accelerator import AcceleratorVendor
+from jasna.media import VideoMetadata, validate_encoder_settings
 from jasna.media.rgb_to_nv12 import (
     chw_rgb_to_nv12_bt2020_full,
     chw_rgb_to_nv12_bt2020_limited,
@@ -32,12 +33,14 @@ from jasna.media.rgb_to_p010 import (
     chw_rgb_to_p010_bt709_limited,
 )
 from jasna.media.video_encoder import (
+    AMF_ENCODER_SPECS,
     DEFAULT_AV1_ENCODER_OPTIONS,
     DEFAULT_ENCODER_OPTIONS,
     DEFAULT_H264_ENCODER_OPTIONS,
     ENCODER_SPECS,
     _CODEC_MAP,
     _align_yuv_pitch,
+    _eight_bit_spec,
     NvidiaVideoEncoder,
 )
 
@@ -67,6 +70,18 @@ def _make_encoder(tmp_path, encoder_settings=None, codec="hevc", **meta_override
     return NvidiaVideoEncoder(
         file=str(tmp_path / "result.mkv"),
         device=torch.device("cuda:0"),
+        metadata=_fake_metadata(**meta_overrides),
+        codec=codec,
+        encoder_settings=encoder_settings or {},
+    )
+
+
+def _make_qsv_encoder(tmp_path, encoder_settings=None, codec="hevc", **meta_overrides) -> NvidiaVideoEncoder:
+    # torch.device("xpu:0") resolves to AcceleratorVendor.INTEL without needing
+    # XPU hardware; only the constructor (and mocked internals) run in tests.
+    return NvidiaVideoEncoder(
+        file=str(tmp_path / "result.mkv"),
+        device=torch.device("xpu:0"),
         metadata=_fake_metadata(**meta_overrides),
         codec=codec,
         encoder_settings=encoder_settings or {},
@@ -313,6 +328,185 @@ class TestColorHandling:
     def test_unsupported_color_range_raises_for_new_codecs(self, tmp_path, codec):
         with pytest.raises(ValueError, match="Unsupported color space or color range"):
             _make_encoder(tmp_path, codec=codec, color_range=AvColorRange.UNSPECIFIED)
+
+
+class TestQsvEncoderSettings:
+    @pytest.mark.parametrize("codec", ["hevc", "h264", "av1"])
+    def test_validate_accepts_portable_cq(self, codec):
+        settings = {"cq": 23}
+        assert validate_encoder_settings(
+            settings, codec=codec, vendor=AcceleratorVendor.INTEL
+        ) is settings
+
+    @pytest.mark.parametrize("codec", ["hevc", "h264", "av1"])
+    def test_cq_translates_to_global_quality(self, tmp_path, codec):
+        enc = _make_qsv_encoder(tmp_path, codec=codec, encoder_settings={"cq": 23})
+        assert enc.encoder_options["global_quality"] == "23"
+        assert "cq" not in enc.encoder_options
+
+    def test_cq_conflicts_with_global_quality(self, tmp_path):
+        with pytest.raises(ValueError, match="cq and global_quality are aliases"):
+            _make_qsv_encoder(
+                tmp_path,
+                encoder_settings={"cq": 23, "global_quality": 22},
+            )
+
+
+class TestEightBitSpecRebuild:
+    @pytest.mark.parametrize("codec", ["hevc", "av1"])
+    def test_amf_rebuild_drops_bitdepth(self, codec):
+        assert AMF_ENCODER_SPECS[codec].default_options["bitdepth"] == "10"
+        rebuilt = _eight_bit_spec(AMF_ENCODER_SPECS[codec])
+        assert "bitdepth" not in rebuilt.default_options
+        assert rebuilt.frame_format == "nv12"
+        assert rebuilt.ten_bit is False
+
+    def test_amf_hevc_rebuild_uses_main_profile(self):
+        assert _eight_bit_spec(AMF_ENCODER_SPECS["hevc"]).default_options["profile"] == "main"
+
+    def test_nvenc_hevc_rebuild_only_touches_profile(self):
+        rebuilt = _eight_bit_spec(ENCODER_SPECS["hevc"])
+        expected = dict(DEFAULT_ENCODER_OPTIONS)
+        expected["profile"] = "main"
+        assert dict(rebuilt.default_options) == expected
+
+
+class _LockSpy:
+    """Context-manager double for codec_open_lock recording whether it is held."""
+
+    def __init__(self):
+        self.held = False
+
+    def __enter__(self):
+        self.held = True
+
+    def __exit__(self, *exc_info):
+        self.held = False
+
+
+class _FakeCodecContext:
+    def __init__(self, lock_spy):
+        self._lock_spy = lock_spy
+        self.is_open = False
+        self.open_strict = None
+        self.opened_under_lock = None
+        self.options = {}
+
+    def open(self, strict=True):
+        self.open_strict = strict
+        self.opened_under_lock = self._lock_spy.held
+        self.is_open = True
+
+
+class TestCodecOpenLockCoverage:
+    def test_enter_opens_qsv_codec_context_under_lock(self, tmp_path, monkeypatch):
+        enc = NvidiaVideoEncoder(
+            file=str(tmp_path / "result.mkv"),
+            device=torch.device("xpu:0"),
+            metadata=_fake_metadata(video_width=64, video_height=32, is_10bit=False),
+            codec="h264",
+            encoder_settings={},
+            mux_audio=False,
+        )
+        spy = _LockSpy()
+        ctx = _FakeCodecContext(spy)
+        out_v = SimpleNamespace(codec_context=ctx)
+        dst = MagicMock()
+        dst.add_stream.return_value = out_v
+        monkeypatch.setattr(video_encoder_module, "codec_open_lock", spy)
+        monkeypatch.setattr(video_encoder_module.av, "Codec", MagicMock())
+        monkeypatch.setattr(
+            video_encoder_module.av, "open", MagicMock(side_effect=[MagicMock(), dst])
+        )
+        monkeypatch.setattr(video_encoder_module, "new_stream", MagicMock())
+        monkeypatch.setattr(video_encoder_module, "set_device", MagicMock())
+        try:
+            enc.__enter__()
+            # The real avcodec_open2 must run inside __enter__ (not at the
+            # first worker-thread encode) and under codec_open_lock.
+            assert ctx.is_open is True
+            assert ctx.open_strict is False
+            assert ctx.opened_under_lock is True
+        finally:
+            enc._encode_queue.put(enc._stop_sentinel)
+            enc._encode_thread.join(timeout=5)
+
+    def test_nvenc_lazy_open_first_encode_holds_lock(self, tmp_path, monkeypatch):
+        enc = _make_encoder(tmp_path, codec="h264", video_width=2, video_height=2)
+        enc.stream = MagicMock()
+        enc._cuda_ctx = object()
+        enc._lut_applier = None
+        enc._to_yuv = lambda frame: torch.zeros((3, 2), dtype=torch.uint8)
+        spy = _LockSpy()
+        monkeypatch.setattr(video_encoder_module, "codec_open_lock", spy)
+        held_during_encode = []
+        enc.out_stream = MagicMock()
+        enc.out_stream.codec_context.is_open = False
+
+        def _encode(hw_frame):
+            held_during_encode.append(spy.held)
+            enc.out_stream.codec_context.is_open = True
+            return []
+
+        enc.out_stream.encode.side_effect = _encode
+        hw_frame = SimpleNamespace(pts=None, time_base=None)
+        monkeypatch.setattr(
+            video_encoder_module.av,
+            "VideoFrame",
+            SimpleNamespace(from_dlpack=MagicMock(return_value=hw_frame)),
+        )
+        monkeypatch.setattr(video_encoder_module.torch.cuda, "stream", lambda stream: nullcontext())
+
+        enc._encode_frame(torch.zeros((3, 2, 2), dtype=torch.uint8), 0)
+        enc._encode_frame(torch.zeros((3, 2, 2), dtype=torch.uint8), 512)
+
+        # NVENC's open happens inside the first encode(); it must be locked,
+        # and steady-state encodes must not be.
+        assert held_during_encode == [True, False]
+
+
+class TestQsvFrameOwnership:
+    def test_consecutive_frames_do_not_alias_staging_buffer(self, tmp_path, monkeypatch):
+        enc = _make_qsv_encoder(
+            tmp_path, codec="h264", video_width=4, video_height=2, is_10bit=False
+        )
+        enc.stream = MagicMock()
+        enc._lut_applier = None
+        yuv = [
+            torch.arange(12, dtype=torch.uint8).reshape(3, 4),
+            torch.arange(12, 24, dtype=torch.uint8).reshape(3, 4),
+        ]
+        staged_yuv = iter(yuv)
+        enc._to_yuv = lambda frame: next(staged_yuv)
+        enc._host_yuv = torch.zeros((3, 4), dtype=torch.uint8)
+        enc.out_stream = MagicMock()
+        enc.out_stream.encode.return_value = []
+        hw_frame = SimpleNamespace(pts=None, time_base=None)
+        from_dlpack = MagicMock(return_value=hw_frame)
+        monkeypatch.setattr(
+            video_encoder_module.av,
+            "VideoFrame",
+            SimpleNamespace(from_dlpack=from_dlpack),
+        )
+        monkeypatch.setattr(video_encoder_module.torch.cuda, "stream", lambda stream: nullcontext())
+
+        enc._encode_frame(torch.zeros((3, 2, 4), dtype=torch.uint8), 0)
+        enc._encode_frame(torch.zeros((3, 2, 4), dtype=torch.uint8), 512)
+
+        (first_planes,), first_kwargs = from_dlpack.call_args_list[0]
+        (second_planes,), second_kwargs = from_dlpack.call_args_list[1]
+        assert first_kwargs == {"format": "nv12"}
+        assert second_kwargs == {"format": "nv12"}
+        # qsvenc encodes asynchronously and refs system-memory frames, so no
+        # submitted frame may alias the reused staging buffer or another frame.
+        staging_ptrs = {enc._host_yuv[:2].data_ptr(), enc._host_yuv[2:].data_ptr()}
+        for planes in (first_planes, second_planes):
+            assert {planes[0].data_ptr(), planes[1].data_ptr()}.isdisjoint(staging_ptrs)
+        assert first_planes[0].data_ptr() != second_planes[0].data_ptr()
+        # Each frame kept the pixels staged for it even after the staging
+        # buffer was overwritten by the next frame.
+        assert torch.equal(torch.cat([first_planes[0], first_planes[1]]), yuv[0])
+        assert torch.equal(torch.cat([second_planes[0], second_planes[1]]), yuv[1])
 
 
 def _buffered_encoder(tmp_path) -> NvidiaVideoEncoder:

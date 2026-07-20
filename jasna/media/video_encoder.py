@@ -332,6 +332,24 @@ def _amf_host_input(packed: torch.Tensor, *, ten_bit: bool) -> torch.Tensor:
     return packed.view(torch.uint16) if ten_bit else packed
 
 
+def _eight_bit_spec(spec: EncoderSpec) -> EncoderSpec:
+    """Rebuild an hevc/av1 spec for 8-bit nv12 output (match_input_bit_depth)."""
+    options = dict(spec.default_options)
+    if spec.name == "hevc":
+        options["profile"] = "main"
+    # The AMF hevc/av1 defaults pin "bitdepth": "10", which would contradict
+    # the 8-bit profile/nv12 input of the rebuilt spec.
+    options.pop("bitdepth", None)
+    return EncoderSpec(
+        name=spec.name,
+        encoder_name=spec.encoder_name,
+        frame_format="nv12",
+        default_options=MappingProxyType(options),
+        ten_bit=False,
+        supported_settings=spec.supported_settings,
+    )
+
+
 class NvidiaVideoEncoder:
     def __init__(
         self,
@@ -368,17 +386,7 @@ class NvidiaVideoEncoder:
             raise ValueError(f"Unsupported codec: {codec}")
         spec = specs[codec]
         if match_input_bit_depth and codec in {"hevc", "av1"} and not metadata.is_10bit:
-            options = dict(spec.default_options)
-            if codec == "hevc":
-                options["profile"] = "main"
-            spec = EncoderSpec(
-                name=spec.name,
-                encoder_name=spec.encoder_name,
-                frame_format="nv12",
-                default_options=MappingProxyType(options),
-                ten_bit=False,
-                supported_settings=spec.supported_settings,
-            )
+            spec = _eight_bit_spec(spec)
         converter_map = _COLOR_CONVERTERS if spec.frame_format == "p010le" else _COLOR_CONVERTERS_NV12
         converter = converter_map.get((metadata.color_space, metadata.color_range))
         if converter is None:
@@ -427,6 +435,13 @@ class NvidiaVideoEncoder:
                         "qvbr_quality_level are aliases on AMD; use only one"
                     )
                 overrides["qvbr_quality_level"] = overrides.pop("cq")
+            if self.vendor is AcceleratorVendor.INTEL and "cq" in overrides:
+                if "global_quality" in overrides:
+                    raise ValueError(
+                        "Conflicting encoder settings: cq and "
+                        "global_quality are aliases on Intel; use only one"
+                    )
+                overrides["global_quality"] = overrides.pop("cq")
             self.encoder_options.update(overrides)
         if self.smart_fragment:
             self.encoder_options["forced-idr"] = "1"
@@ -498,6 +513,21 @@ class NvidiaVideoEncoder:
         ctx.color_primaries = primaries
         ctx.color_trc = transfer
         self.out_stream = out_v
+
+        if self.vendor is not AcceleratorVendor.NVIDIA:
+            # add_stream only allocates the context; PyAV runs the real
+            # avcodec_open2 lazily at the first encode(), i.e. on the worker
+            # thread outside codec_open_lock. AMF/QSV consume system-memory
+            # frames and are fully configured here, so open eagerly under the
+            # lock (strict=False matches the decoder-side opens). NVENC cannot
+            # open yet: avcodec_open2 needs the hw frames context that PyAV
+            # adopts from the first DLPack frame, so its first encode() holds
+            # the lock instead (see _encode_frame).
+            try:
+                with codec_open_lock:
+                    ctx.open(strict=False)
+            except av.FFmpegError as exc:
+                raise self._encoder_open_error(exc) from exc
 
         self._setup_audio()
 
@@ -756,7 +786,16 @@ class NvidiaVideoEncoder:
         self.stream.synchronize()
         if self.vendor is not AcceleratorVendor.NVIDIA:
             # AMF/QSV: build the frame from the staged system-memory buffer.
-            planes = [self._host_yuv[:height], self._host_yuv[height:]]
+            staged = self._host_yuv
+            if self.vendor is AcceleratorVendor.INTEL:
+                # qsvenc refs (does not copy) suitably aligned system-memory
+                # frames and encodes asynchronously, so in-flight frames must
+                # not alias the reused staging buffer that the next
+                # _encode_frame overwrites. Hand each frame its own copy; the
+                # DLPack capsule ties its lifetime to the AVFrame. (amfenc
+                # copies at submit; NVENC wraps a fresh device tensor.)
+                staged = staged.clone()
+            planes = [staged[:height], staged[height:]]
             hw_frame = av.VideoFrame.from_dlpack(
                 planes,
                 format=self.spec.frame_format,
@@ -777,7 +816,15 @@ class NvidiaVideoEncoder:
         hw_frame.pts = pts
         hw_frame.time_base = self.metadata.time_base
         try:
-            packets = self.out_stream.encode(hw_frame)
+            if self.out_stream.codec_context.is_open:
+                packets = self.out_stream.encode(hw_frame)
+            else:
+                # NVENC's real avcodec_open2 runs inside this first encode()
+                # (PyAV adopts the frame's hw frames context just before the
+                # open), so it must honor codec_open_lock. AMF/QSV were opened
+                # in __enter__ and never reach this branch.
+                with codec_open_lock:
+                    packets = self.out_stream.encode(hw_frame)
         except av.FFmpegError as exc:
             if not self._video_started:
                 raise self._encoder_open_error(exc) from exc

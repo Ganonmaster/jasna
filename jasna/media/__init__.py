@@ -96,9 +96,10 @@ AMF_SUPPORTED_ENCODER_SETTINGS: frozenset[str] = frozenset().union(
     *AMF_SUPPORTED_ENCODER_SETTINGS_BY_CODEC.values()
 )
 
-# Intel QSV (*_qsv) option names.
+# Intel QSV (*_qsv) option names. ``cq`` is kept as a portable Jasna option
+# and is translated to QSV's global_quality by the encoder.
 _COMMON_QSV_ENCODER_SETTINGS: frozenset[str] = frozenset(
-    {"preset", "profile", "g", "bf", "maxrate", "bufsize", "global_quality", "async_depth", "low_power"}
+    {"preset", "profile", "g", "bf", "maxrate", "bufsize", "cq", "global_quality", "async_depth", "low_power"}
 )
 
 QSV_SUPPORTED_ENCODER_SETTINGS_BY_CODEC: dict[str, frozenset[str]] = {
