@@ -245,6 +245,50 @@ def test_amf_decoder_falls_back_to_software_when_hw_yields_no_frames(monkeypatch
     assert reader.container.seeks == [0]
 
 
+def test_amf_decoder_drops_edit_list_preroll_frames() -> None:
+    # Same leak as qsvdec: the dedicated AMF contexts have no
+    # AV_PKT_FLAG_DISCARD handling, so mp4 edit-list pre-roll frames
+    # (negative pts) must be dropped by the reader itself.
+    import jasna.media.video_decoder as module
+
+    hw = MagicMock()
+    hw.name = "h264_amf"
+    hw.decode.side_effect = lambda packet: [SimpleNamespace(pts=packet.pts)]
+
+    class _FakeContainer:
+        def __init__(self, packets):
+            self.packets = packets
+
+        def demux(self, _stream):
+            return iter(self.packets)
+
+    reader = module.NvidiaVideoReader(
+        "input.mp4",
+        4,
+        torch.device("cuda:0"),
+        _metadata(),
+    )
+    reader.container = _FakeContainer(
+        [
+            SimpleNamespace(pts=-2, is_discard=True),
+            SimpleNamespace(pts=-1, is_discard=True),
+            SimpleNamespace(pts=0, is_discard=False),
+            SimpleNamespace(pts=1, is_discard=False),
+        ]
+    )
+    reader.video_stream = SimpleNamespace(
+        start_time=0,
+        time_base=Fraction(1, 30),
+        codec_context=SimpleNamespace(name="h264", extradata=b"header"),
+    )
+    reader._decoder_ctx = hw
+    reader._hw_decoder = True
+    reader._amd_hardware_decode = True
+
+    frames = list(reader._decoded_frames(None))
+    assert [frame.pts for frame in frames] == [0, 1]
+
+
 def test_migraphx_runner_provider_and_tensor_bridge(monkeypatch, tmp_path) -> None:
     import jasna.mosaic.migraphx_runner as module
 

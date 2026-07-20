@@ -770,6 +770,15 @@ class NvidiaVideoEncoder:
         return RuntimeError(message)
 
     def _encode_frame(self, frame: torch.Tensor, pts: int, *, apply_lut: bool = True):
+        if self.vendor is AcceleratorVendor.INTEL and pts < 0:
+            # oneVPL timestamps are unsigned: a negative pts wraps to ~2**64,
+            # the runtime derives a garbage DecodeTimeStamp from it, and the
+            # mp4 muxer rejects the pair ("pts/dts pair unsupported"). Negative
+            # pts here means edit-list pre-roll frames leaked past the decoder.
+            raise RuntimeError(
+                f"QSV cannot encode a frame with negative pts ({pts}); "
+                "the decoder should have dropped edit-list pre-roll frames"
+            )
         with stream_context(self.stream):
             if apply_lut and self._lut_applier is not None:
                 frame = self._lut_applier.apply(frame)

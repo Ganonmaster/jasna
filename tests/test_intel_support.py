@@ -327,6 +327,59 @@ def test_qsv_decoder_error_after_frames_stays_fatal(monkeypatch) -> None:
     assert reader._decoder_ctx is hw
 
 
+def test_qsv_decoder_drops_edit_list_preroll_frames() -> None:
+    # The mov demuxer flags edit-list pre-roll packets AV_PKT_FLAG_DISCARD and
+    # demuxes them with negative pts. Native decoders drop the decoded frames
+    # (decode.c), but qsvdec has no discard handling, so the reader must drop
+    # frames matching flagged packets itself — a leaked negative-pts frame
+    # breaks QSV encoding (oneVPL timestamps are unsigned).
+    import jasna.media.video_decoder as module
+
+    hw = MagicMock()
+    hw.name = "h264_qsv"
+    # B-frame reorder: pre-roll frames surface one packet late.
+    hw.decode.side_effect = [
+        [],
+        [SimpleNamespace(pts=-2)],
+        [SimpleNamespace(pts=-1), SimpleNamespace(pts=0)],
+        [SimpleNamespace(pts=1)],
+    ]
+
+    reader = _reader_with_hw_decoder(module, hw)
+    reader.container = _FakeContainer(
+        [
+            SimpleNamespace(pts=-2, is_discard=True),
+            SimpleNamespace(pts=-1, is_discard=True),
+            SimpleNamespace(pts=0, is_discard=False),
+            SimpleNamespace(pts=1, is_discard=False),
+        ]
+    )
+
+    frames = list(reader._decoded_frames(None))
+    assert [frame.pts for frame in frames] == [0, 1]
+
+
+def test_discard_tracking_only_applies_to_dedicated_hw_contexts() -> None:
+    # Native/software decoders already honor AV_PKT_FLAG_DISCARD in decode.c;
+    # the reader must not second-guess them.
+    import jasna.media.video_decoder as module
+
+    sw = MagicMock()
+    sw.decode.side_effect = lambda packet: [SimpleNamespace(pts=packet.pts)]
+
+    reader = _reader_with_hw_decoder(module, sw)
+    reader._hw_decoder = False
+    reader.container = _FakeContainer(
+        [
+            SimpleNamespace(pts=0, is_discard=True),
+            SimpleNamespace(pts=1, is_discard=False),
+        ]
+    )
+
+    frames = list(reader._decoded_frames(None))
+    assert [frame.pts for frame in frames] == [0, 1]
+
+
 class _FakePlane(bytearray):
     line_size: int
 

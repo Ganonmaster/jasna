@@ -465,6 +465,18 @@ class TestCodecOpenLockCoverage:
         assert held_during_encode == [True, False]
 
 
+class TestQsvNegativePtsGuard:
+    def test_negative_pts_is_rejected_with_a_clear_error(self, tmp_path):
+        # oneVPL timestamps are unsigned: a negative pts wraps to ~2**64 and
+        # the mp4 muxer later rejects the garbage pts/dts pair with an opaque
+        # PatchWelcomeError. The QSV arm must fail loudly at the source.
+        enc = _make_qsv_encoder(
+            tmp_path, codec="h264", video_width=4, video_height=2, is_10bit=False
+        )
+        with pytest.raises(RuntimeError, match="negative pts"):
+            enc._encode_frame(torch.zeros((3, 2, 4), dtype=torch.uint8), -3003)
+
+
 class TestQsvFrameOwnership:
     def test_consecutive_frames_do_not_alias_staging_buffer(self, tmp_path, monkeypatch):
         enc = _make_qsv_encoder(

@@ -310,11 +310,24 @@ class NvidiaVideoReader:
             target_pts = self._position_at(seek_ts)
 
         consecutive_errors = 0
+        # ffmpeg's native decoders drop the frames of AV_PKT_FLAG_DISCARD
+        # packets (mp4 edit-list pre-roll, demuxed with negative pts), but the
+        # dedicated qsv/amf contexts have no discard handling, and a leaked
+        # negative-pts frame corrupts QSV encoding downstream (oneVPL
+        # timestamps are unsigned). Track flagged packets by pts and drop the
+        # matching decoded frames ourselves.
+        discard_pts: set[int] = set()
         packets = self.container.demux(self.video_stream)
         while True:
             packet = next(packets, None)
             if packet is None:
                 return
+            if (
+                self._hw_decoder
+                and packet.pts is not None
+                and getattr(packet, "is_discard", False)
+            ):
+                discard_pts.add(packet.pts)
             try:
                 frames, consecutive_errors = self._decode_packet(packet, consecutive_errors)
             except _HardwareDecodeInitError as e:
@@ -322,9 +335,13 @@ class NvidiaVideoReader:
                 self._fall_back_to_software_decoder(e.error)
                 target_pts = self._position_at(seek_ts)
                 consecutive_errors = 0
+                discard_pts.clear()
                 packets = self.container.demux(self.video_stream)
                 continue
             for frame in frames:
+                if frame.pts is not None and frame.pts in discard_pts:
+                    discard_pts.discard(frame.pts)
+                    continue
                 if target_pts is not None and frame.pts is not None and frame.pts < target_pts:
                     continue
                 target_pts = None
