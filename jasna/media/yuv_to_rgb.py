@@ -248,8 +248,10 @@ class YuvToRgbConverter:
     """NV12/P010 planes -> planar RGB uint8 (3, H, W) on GPU.
 
     CUDA conversion is one ahead-of-time-compiled kernel that writes directly
-    into the destination tensor. The CPU implementation is the unit-test/reference
-    path. 10-bit output uses the same 8x8 Bayer ordered dither as the VALI decoder.
+    into the destination tensor. Everything else (the CPU unit-test/reference
+    path and non-NVIDIA GPUs such as ROCm or XPU) uses the eager torch path,
+    whose constants live on the constructor's device. 10-bit output uses the
+    same 8x8 Bayer ordered dither as the VALI decoder.
     """
 
     def __init__(
@@ -406,9 +408,9 @@ class YuvToRgbConverter:
 
         P010 planes store the 10-bit value in the top bits (value << 6).
         """
-        if y.is_cuda:
-            if self._cuda_kernel is None:
-                raise RuntimeError("CPU YUV converter cannot process CUDA planes")
+        if self._cuda_kernel is not None:
+            if not y.is_cuda:
+                raise RuntimeError("CUDA YUV converter cannot process CPU planes")
             expected = torch.uint16 if self.is_10bit else torch.uint8
             if y.dtype != expected or uv.dtype != expected:
                 raise TypeError(
@@ -426,8 +428,14 @@ class YuvToRgbConverter:
             self._cuda_kernel.launch(y, uv, out)
             return
 
-        if self._cuda_kernel is not None:
-            raise RuntimeError("CUDA YUV converter cannot process CPU planes")
+        # No fused kernel (CPU, or a non-NVIDIA GPU such as ROCm/XPU): the
+        # eager path runs on the constructor's device, so the only impossible
+        # input is planes that live somewhere else.
+        if y.device != self._offset.device:
+            raise RuntimeError(
+                f"YUV converter built for {self._offset.device} "
+                f"cannot process planes on {y.device}"
+            )
         self._convert_eager(y, uv, out)
 
     def _convert_eager(self, y: torch.Tensor, uv: torch.Tensor, out: torch.Tensor) -> None:

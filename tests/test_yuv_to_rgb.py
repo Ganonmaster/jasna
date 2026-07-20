@@ -1,8 +1,10 @@
 """Unit tests for NV12/P010 -> planar RGB uint8 conversion (BT.709/BT.601, limited/full range)."""
 import numpy as np
+import pytest
 import torch
 from av.video.reformatter import Colorspace as AvColorspace
 
+from jasna.media import yuv_to_rgb
 from jasna.media.rgb_to_p010 import (
     chw_rgb_to_p010_bt601_limited,
     chw_rgb_to_p010_bt709_limited,
@@ -109,3 +111,79 @@ def test_matches_swscale_reference_bt709_limited():
     )
     ours = out.permute(1, 2, 0).numpy().astype(np.int16)
     assert np.abs(ours - reference).max() <= 3
+
+
+class _FakeCudaTensor(torch.Tensor):
+    """CPU tensor that reports itself CUDA-resident (stands in for ROCm planes)."""
+
+    @property
+    def is_cuda(self):
+        return True
+
+
+class _FakeDeviceTensor(torch.Tensor):
+    """CPU tensor that claims to live on a device the converter was not built for."""
+
+    @property
+    def device(self):
+        return torch.device("cuda", 0)
+
+
+def test_gpu_planes_without_kernel_route_to_eager(monkeypatch):
+    # AMD/Intel scenario: device planes but no fused kernel must dispatch to
+    # the eager path, not raise (regression for the old is_cuda guard).
+    monkeypatch.setattr(yuv_to_rgb, "is_nvidia_device", lambda device: False)
+    conv = _converter()
+    assert conv._cuda_kernel is None
+    calls = []
+    eager = conv._convert_eager
+    monkeypatch.setattr(
+        conv, "_convert_eager", lambda y, uv, out: (calls.append(1), eager(y, uv, out))
+    )
+    y, uv = _uniform_planes(120, 90, 200)
+    out = torch.empty((3, 4, 4), dtype=torch.uint8)
+    conv.convert_into(y.as_subclass(_FakeCudaTensor), uv.as_subclass(_FakeCudaTensor), out)
+    assert calls == [1]
+
+
+def test_gpu_planes_without_kernel_match_eager_reference(monkeypatch):
+    monkeypatch.setattr(yuv_to_rgb, "is_nvidia_device", lambda device: False)
+    conv = _converter(h=8, w=8)
+    torch.manual_seed(3)
+    y = torch.randint(16, 236, (8, 8), dtype=torch.uint8)
+    uv = torch.randint(16, 241, (4, 4, 2), dtype=torch.uint8)
+    reference = _converter(h=8, w=8).convert(y, uv)
+    out = torch.zeros((3, 8, 8), dtype=torch.uint8)
+    conv.convert_into(y.as_subclass(_FakeCudaTensor), uv.as_subclass(_FakeCudaTensor), out)
+    assert torch.equal(out, reference)
+
+
+def test_gpu_planes_without_kernel_match_eager_reference_10bit(monkeypatch):
+    monkeypatch.setattr(yuv_to_rgb, "is_nvidia_device", lambda device: False)
+    conv = _converter(h=8, w=8, is_10bit=True)
+    torch.manual_seed(5)
+    y = torch.randint(64 << 6, 940 << 6, (8, 8), dtype=torch.int32).to(torch.float32)
+    uv = torch.randint(64 << 6, 960 << 6, (4, 4, 2), dtype=torch.int32).to(torch.float32)
+    reference = _converter(h=8, w=8, is_10bit=True).convert(y, uv)
+    out = torch.zeros((3, 8, 8), dtype=torch.uint8)
+    conv.convert_into(y.as_subclass(_FakeCudaTensor), uv.as_subclass(_FakeCudaTensor), out)
+    assert torch.equal(out, reference)
+
+
+def test_eager_converter_rejects_planes_on_other_device():
+    conv = _converter()
+    y, uv = _uniform_planes(120, 90, 200)
+    out = torch.empty((3, 4, 4), dtype=torch.uint8)
+    with pytest.raises(RuntimeError, match="cannot process planes on"):
+        conv.convert_into(y.as_subclass(_FakeDeviceTensor), uv, out)
+
+
+def test_cuda_kernel_converter_rejects_cpu_planes(monkeypatch):
+    # Kernel construction is lazy (no driver call until launch), so forcing the
+    # NVIDIA branch is safe on machines without CUDA.
+    monkeypatch.setattr(yuv_to_rgb, "is_nvidia_device", lambda device: True)
+    conv = _converter()
+    assert conv._cuda_kernel is not None
+    y, uv = _uniform_planes(120, 90, 200)
+    with pytest.raises(RuntimeError, match="cannot process CPU planes"):
+        conv.convert_into(y, uv, torch.empty((3, 4, 4), dtype=torch.uint8))
