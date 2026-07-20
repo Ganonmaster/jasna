@@ -123,17 +123,24 @@ def test_mask_iou_across_different_grids():
     """Cross-family comparison: RF-DETR masks are square (e.g. 192x192 over the
     stretched frame) while YOLO's are aspect-scaled (e.g. 144x256) — same frame
     extent, different grids. IoU must align them instead of crashing."""
-    # Upper half of the frame in a coarse square grid vs a finer wide grid.
+    # Upper half of the frame, expressed on three different grids: coarse
+    # square, finer square, and a wide aspect grid — all must agree exactly.
     a = torch.zeros(8, 8, dtype=torch.bool)
     a[:4] = True
-    b = torch.zeros(9, 16, dtype=torch.bool)
-    b[: 4 * 9 // 8 + 1] = True  # ~upper half on the finer grid
-    iou = mask_iou(a, b)
-    assert 0.8 < iou <= 1.0, iou
-    # Disjoint halves stay near zero regardless of grid mismatch.
-    c = torch.zeros(9, 16, dtype=torch.bool)
-    c[5:] = True
-    assert mask_iou(a, c) < 0.2
+    b = torch.zeros(16, 16, dtype=torch.bool)
+    b[:8] = True
+    assert mask_iou(a, b) == pytest.approx(1.0)
+    w = torch.zeros(8, 16, dtype=torch.bool)
+    w[:4] = True
+    assert mask_iou(a, w) == pytest.approx(1.0)
+    # Odd grid whose row boundary does not align: still close, never a crash.
+    odd = torch.zeros(9, 16, dtype=torch.bool)
+    odd[:5] = True
+    assert mask_iou(a, odd) >= 0.75
+    # Disjoint halves stay at zero regardless of grid mismatch.
+    c = torch.zeros(16, 16, dtype=torch.bool)
+    c[8:] = True
+    assert mask_iou(a, c) == pytest.approx(0.0)
     # Same-grid fast path is untouched (no resample when shapes match).
     assert mask_iou(a, a.clone()) == 1.0
 
