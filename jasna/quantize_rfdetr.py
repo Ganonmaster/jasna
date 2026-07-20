@@ -102,6 +102,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="JSON file with an NNCF IgnoredScope dict (e.g. "
                              '{"names": [...]} or {"patterns": [...]}) to keep '
                              "listed layers in fp precision")
+    parser.add_argument("--model-type", choices=["transformer", "plain"],
+                        default="transformer",
+                        help="'transformer' protects DETR's quantization-"
+                             "sensitive attention (best quality). 'plain' "
+                             "quantizes maximally aggressively — use it to "
+                             "measure the INT8 speed CEILING, ignoring quality")
     args = parser.parse_args(argv)
 
     try:
@@ -140,12 +146,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Ignored scope: {scope_kwargs}")
 
     dataset = nncf.Dataset(batches, lambda paths: {input_name: _load_batch(paths)})
-    print("Quantizing (model_type=TRANSFORMER; this takes a few minutes)...")
+    model_type = (
+        nncf.ModelType.TRANSFORMER if args.model_type == "transformer" else None
+    )
+    print(f"Quantizing (model_type={args.model_type}; this takes a few minutes)...")
     start = time.perf_counter()
     quantized = nncf.quantize(
         model,
         dataset,
-        model_type=nncf.ModelType.TRANSFORMER,
+        model_type=model_type,
         subset_size=len(batches),
         ignored_scope=ignored_scope,
     )
