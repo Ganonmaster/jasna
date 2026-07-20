@@ -80,7 +80,7 @@ def build_video_session(
     from jasna._suppress_noise import install as _install_noise_filters
     _install_noise_filters()
     import torch
-    from jasna.accelerator import is_amd_device
+    from jasna.accelerator import is_amd_device, is_nvidia_device, vendor_for_device
     from jasna.engine_compiler import EngineCompilationRequest, ensure_engines_compiled
     from jasna.engine_paths import model_weights_dir
     from jasna.mosaic.detection_registry import coerce_detection_model_name, require_detection_model_weights
@@ -94,10 +94,11 @@ def build_video_session(
     detection_model_path = require_detection_model_weights(det_name)
 
     amd = is_amd_device(device)
-    if amd and settings.secondary_restoration != "none":
+    # Secondary restorers are NVIDIA-only for now; mirrors the CLI gate in main.py.
+    if not is_nvidia_device(device) and settings.secondary_restoration != "none":
         raise RuntimeError(
             f"Secondary restoration '{settings.secondary_restoration}' is not "
-            "available in the AMD build yet"
+            f"available on the {vendor_for_device(device).value} build yet"
         )
     compile_basicvsrpp = (
         bool(settings.compile_basicvsrpp)

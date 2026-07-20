@@ -339,6 +339,8 @@ class Processor:
         codec = settings.codec
         splice_plan = None
         if segments:
+            import torch
+
             from jasna.media import get_video_meta_data
             from jasna.media.splice import build_splice_plan, probe_keyframes, validate_smart_render
             metadata = get_video_meta_data(str(input_path))
@@ -347,11 +349,15 @@ class Processor:
                 "h265": "hevc",
                 "av01": "av1",
             }.get(metadata.codec_name.lower(), metadata.codec_name.lower())
+            # Validation runs before the (expensive) session build, so pass the
+            # device the session will use (build_video_session's cuda:0) to fail
+            # upfront on non-NVENC backends instead of mid-export.
             validate_smart_render(
                 metadata,
                 output_path=output_path,
                 codec=codec,
                 retarget_high_fps=settings.retarget_high_fps,
+                device=torch.device("cuda:0"),
             )
             splice_plan = build_splice_plan(
                 tuple(segments),
@@ -413,6 +419,8 @@ class Processor:
         finally:
             if pipeline is not None:
                 pipeline.close()
+            from jasna.tracking.blending import _KERNEL_CACHE
+            _KERNEL_CACHE.clear()
             from jasna.media.rgb_to_p010 import _cache as _p010_cache
             _p010_cache.clear()
             from jasna.media.rgb_to_nv12 import _cache as _nv12_cache

@@ -141,8 +141,48 @@ def test_amd_preflight_checks_only_migraphx_cache(monkeypatch, tmp_path: Path) -
         lambda *_args, **_kwargs: False,
     )
 
-    settings = AppSettings(compile_basicvsrpp=True)
+    # basicvsrpp/unet-4x are TensorRT-only: neither may show up as a requirement.
+    settings = AppSettings(compile_basicvsrpp=True, secondary_restoration="unet-4x")
     result = run_engine_preflight(settings)
 
     assert [requirement.key for requirement in result.requirements] == ["rfdetr"]
     assert result.missing[0].paths == (cache,)
+
+
+def test_intel_preflight_checks_only_openvino_cache(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "model_weights").mkdir(parents=True, exist_ok=True)
+
+    import jasna.accelerator as accelerator
+    import jasna.ov.ov_runner as ov_runner
+
+    cache = tmp_path / "model_weights" / "rfdetr-v5.openvino" / "fp16-gpu"
+    monkeypatch.setattr(accelerator, "is_intel_device", lambda _device: True)
+    monkeypatch.setattr(ov_runner, "ov_cache_dir", lambda *_args, **_kwargs: cache)
+    monkeypatch.setattr(
+        ov_runner,
+        "ov_cache_is_ready",
+        lambda *_args, **_kwargs: False,
+    )
+
+    # basicvsrpp/unet-4x are TensorRT-only: neither may show up as a requirement.
+    settings = AppSettings(compile_basicvsrpp=True, secondary_restoration="unet-4x")
+    result = run_engine_preflight(settings)
+
+    assert [requirement.key for requirement in result.requirements] == ["rfdetr"]
+    assert result.missing[0].paths == (cache,)
+
+
+def test_intel_preflight_yolo_has_no_engine_requirement(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "model_weights").mkdir(parents=True, exist_ok=True)
+
+    import jasna.accelerator as accelerator
+
+    monkeypatch.setattr(accelerator, "is_intel_device", lambda _device: True)
+
+    settings = AppSettings(detection_model="lada-yolo-v4")
+    result = run_engine_preflight(settings)
+
+    assert result.requirements == ()
+    assert not result.should_warn_first_run_slow

@@ -34,7 +34,7 @@ def _detection_weights_path(settings: AppSettings) -> Path:
 def run_engine_preflight(settings: AppSettings) -> EnginePreflightResult:
     import torch
 
-    from jasna.accelerator import is_amd_device
+    from jasna.accelerator import is_amd_device, is_intel_device
     from jasna.engine_paths import (
         expected_unet4x_engine_path,
         get_basicvsrpp_sub_engine_paths,
@@ -47,6 +47,7 @@ def run_engine_preflight(settings: AppSettings) -> EnginePreflightResult:
     reqs: list[EngineRequirement] = []
     device = torch.device("cuda:0")
     amd = is_amd_device(device)
+    intel = is_intel_device(device)
 
     det_name = coerce_detection_model_name(str(settings.detection_model))
     det_weights = _detection_weights_path(settings)
@@ -67,6 +68,19 @@ def run_engine_preflight(settings: AppSettings) -> EnginePreflightResult:
                 device,
                 fp16=bool(settings.fp16_mode),
             )
+        elif intel:
+            from jasna.ov.ov_runner import ov_cache_dir, ov_cache_is_ready
+
+            det_engine = ov_cache_dir(
+                det_weights,
+                device,
+                fp16=bool(settings.fp16_mode),
+            )
+            det_exists = ov_cache_is_ready(
+                det_weights,
+                device,
+                fp16=bool(settings.fp16_mode),
+            )
         else:
             det_engine = get_onnx_tensorrt_engine_path(
                 det_weights,
@@ -83,7 +97,8 @@ def run_engine_preflight(settings: AppSettings) -> EnginePreflightResult:
                 missing_paths=() if det_exists else (det_engine,),
             )
         )
-    elif is_yolo_model(det_name) and not amd:
+    # YOLO runs through PyTorch on AMD/Intel and has no compiled engine artifact.
+    elif is_yolo_model(det_name) and not amd and not intel:
         det_engine = get_yolo_tensorrt_engine_path(det_weights, fp16=bool(settings.fp16_mode))
         det_exists = det_engine.is_file()
         reqs.append(
@@ -97,7 +112,7 @@ def run_engine_preflight(settings: AppSettings) -> EnginePreflightResult:
         )
 
     restoration_model_path = model_weights_dir() / "lada_mosaic_restoration_model_generic_v1.2.pth"
-    if bool(settings.compile_basicvsrpp) and not amd:
+    if bool(settings.compile_basicvsrpp) and not amd and not intel:
         sub_paths = get_basicvsrpp_sub_engine_paths(str(restoration_model_path), bool(settings.fp16_mode), int(settings.max_clip_size))
         all_engine_paths = tuple(Path(p) for p in sub_paths.values())
         missing_paths = tuple(p for p in all_engine_paths if not p.is_file())
@@ -111,7 +126,8 @@ def run_engine_preflight(settings: AppSettings) -> EnginePreflightResult:
             )
         )
 
-    if settings.secondary_restoration == "unet-4x":
+    # unet-4x is a TensorRT engine and can only ever exist on the NVIDIA build.
+    if settings.secondary_restoration == "unet-4x" and not amd and not intel:
         unet_engine = expected_unet4x_engine_path(fp16=bool(settings.fp16_mode))
         unet_exists = unet_engine.is_file()
         reqs.append(
