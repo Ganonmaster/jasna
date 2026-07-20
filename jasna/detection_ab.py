@@ -134,6 +134,7 @@ def compare_frame(
     boxes_b: np.ndarray,
     masks_a: torch.Tensor,
     masks_b: torch.Tensor,
+    matches: list[tuple[int, int, float]] | None = None,
 ) -> None:
     stats.frames += 1
     stats.dets_a += len(boxes_a)
@@ -142,11 +143,31 @@ def compare_frame(
         stats.frames_a_detected += 1
         if not len(boxes_b):
             stats.frames_b_blind += 1
-    matches = greedy_match(box_iou_matrix(boxes_a, boxes_b))
+    if matches is None:
+        matches = greedy_match(box_iou_matrix(boxes_a, boxes_b))
     stats.matched += len(matches)
     for ia, ib, iou in matches:
         stats.box_ious.append(iou)
         stats.mask_ious.append(mask_iou(masks_a[ia], masks_b[ib]))
+
+
+def _annotate_disagreement(
+    frames_dir: Path, out_dir: Path, file: str, prefix: str,
+    boxes_a: np.ndarray, boxes_b: np.ndarray,
+) -> None:
+    """Copy the frame with both models' boxes drawn: B (red) under A (green),
+    so the baseline's regions stay visible on top. Boxes are already in the
+    frame's own pixel coordinates (target_hw == the PNG resolution)."""
+    from PIL import Image, ImageDraw
+
+    with Image.open(frames_dir / file) as img:
+        img = img.convert("RGB")
+    draw = ImageDraw.Draw(img)
+    for x1, y1, x2, y2 in boxes_b.tolist():
+        draw.rectangle([x1, y1, x2, y2], outline=(255, 64, 64), width=2)
+    for x1, y1, x2, y2 in boxes_a.tolist():
+        draw.rectangle([x1, y1, x2, y2], outline=(64, 255, 64), width=3)
+    img.save(out_dir / f"{prefix}_{file}")
 
 
 def _load_eval_set(frames_dir: Path) -> list[dict]:
@@ -217,6 +238,7 @@ def run_ab(args: argparse.Namespace) -> int:
 
     per_stratum: dict[str, StratumStats] = defaultdict(StratumStats)
     overall = StratumStats()
+    disagreements: list[tuple[dict, np.ndarray, np.ndarray]] = []
     done = 0
     with torch.inference_mode():
         for batch, batch_entries in _batches_by_resolution(frames_dir, entries):
@@ -225,25 +247,61 @@ def run_ab(args: argparse.Namespace) -> int:
             det_b = models["B"](batch.clone(), target_hw=target_hw)
             for i, entry in enumerate(batch_entries):
                 stratum = entry.get("stratum") or "unlabeled"
+                boxes_a, boxes_b = det_a.boxes_xyxy[i], det_b.boxes_xyxy[i]
+                matches = greedy_match(box_iou_matrix(boxes_a, boxes_b))
                 for stats in (per_stratum[stratum], overall):
                     compare_frame(
-                        stats,
-                        det_a.boxes_xyxy[i], det_b.boxes_xyxy[i],
-                        det_a.masks[i], det_b.masks[i],
+                        stats, boxes_a, boxes_b,
+                        det_a.masks[i], det_b.masks[i], matches=matches,
                     )
+                missed = len(boxes_a) - len(matches)
+                extra = len(boxes_b) - len(matches)
+                if missed or extra:
+                    disagreements.append((
+                        {
+                            "file": entry["file"], "stratum": stratum,
+                            "a_dets": len(boxes_a), "b_dets": len(boxes_b),
+                            "matched": len(matches), "missed_by_b": missed,
+                            "extra_in_b": extra,
+                            "b_blind": bool(len(boxes_a)) and not len(boxes_b),
+                        },
+                        boxes_a.copy(), boxes_b.copy(),
+                    ))
             done += len(batch_entries)
             if done % 100 < BATCH:
                 print(f"  [{done}/{len(entries)}]")
     for m in models.values():
         m.close()
 
+    # Blind frames first (a mosaic B cannot see at all — the decisive cases),
+    # then by how much B missed, then by extras; annotate up to the cap.
+    disagreements.sort(
+        key=lambda d: (not d[0]["b_blind"], -d[0]["missed_by_b"], -d[0]["extra_in_b"])
+    )
+    review_dir = frames_dir / "ab_disagreements"
+    review_dir.mkdir(exist_ok=True)
+    for record, boxes_a, boxes_b in disagreements[: int(args.max_annotated)]:
+        prefix = (
+            "blind" if record["b_blind"]
+            else "miss" if record["missed_by_b"]
+            else "extra"
+        )
+        _annotate_disagreement(
+            frames_dir, review_dir, record["file"], prefix, boxes_a, boxes_b
+        )
+
     report = {
         "config": {k: v for k, v in vars(args).items()},
         "overall": overall.as_dict(),
         "per_stratum": {k: v.as_dict() for k, v in sorted(per_stratum.items())},
+        "disagreements": [record for record, _, _ in disagreements],
     }
     out_file = frames_dir / "ab_report.json"
     out_file.write_text(json.dumps(report, indent=1), encoding="utf-8")
+    print(f"\n{len(disagreements)} disagreement frames; annotated copies of the "
+          f"first {min(len(disagreements), int(args.max_annotated))} in "
+          f"{review_dir} (GREEN = {args.model_a}, RED = {args.model_b}; "
+          f"blind_* are the frames only model A sees)")
 
     print(f"\n{'stratum':12s} {'frames':>6s} {'A-dets':>7s} {'missed':>7s} "
           f"{'miss%':>6s} {'blind':>6s} {'extra':>6s} {'boxIoU':>7s} {'maskIoU':>8s}")
@@ -282,6 +340,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model-b", default="rfdetr-v5-int8")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--score-threshold", type=float, default=0.25)
+    parser.add_argument("--max-annotated", type=int, default=80,
+                        help="Cap on annotated disagreement copies written to "
+                             "<frames>/ab_disagreements/")
     args = parser.parse_args(argv)
     return run_ab(args)
 

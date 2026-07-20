@@ -225,6 +225,7 @@ def _run_ab_with_stubs(tmp_path, monkeypatch, boxes_a, boxes_b) -> int:
     return run_ab(Namespace(
         frames=str(_stub_eval_dir(tmp_path)),
         model_a="a", model_b="b", device="cpu", score_threshold=0.25,
+        max_annotated=80,
     ))
 
 
@@ -244,6 +245,33 @@ def test_ab_passes_and_writes_report_with_live_baseline(tmp_path, monkeypatch):
     assert report["overall"]["miss_rate"] == 0.0
     assert report["overall"]["detections_a"] == 4
     assert report["per_stratum"]["high-conf"]["mean_box_iou"] == pytest.approx(1.0)
+    # Perfect agreement: no disagreement records, no annotated copies.
+    assert report["disagreements"] == []
+    assert list((tmp_path / "ab_disagreements").iterdir()) == []
+
+
+def test_ab_annotates_disagreement_frames(tmp_path, monkeypatch):
+    """B blind on every frame: each frame is recorded as a disagreement and an
+    annotated copy with A's box drawn (green) lands in ab_disagreements/."""
+    from PIL import Image
+
+    boxes_a = np.array([[4.0, 4.0, 20.0, 20.0]])
+    rc = _run_ab_with_stubs(
+        tmp_path, monkeypatch, boxes_a=boxes_a, boxes_b=np.zeros((0, 4)),
+    )
+    assert rc == 0
+    report = json.loads((tmp_path / "ab_report.json").read_text(encoding="utf-8"))
+    assert len(report["disagreements"]) == 4
+    assert all(d["b_blind"] and d["missed_by_b"] == 1 for d in report["disagreements"])
+
+    copies = sorted((tmp_path / "ab_disagreements").iterdir())
+    assert len(copies) == 4
+    assert all(c.name.startswith("blind_") for c in copies)
+    with Image.open(copies[0]) as img:
+        # A's box outline (green, width 3) passes through (4, 10).
+        assert img.getpixel((4, 10)) == (64, 255, 64)
+        # Far outside any box, the original solid color is untouched.
+        assert img.getpixel((40, 40)) != (64, 255, 64)
 
 
 def test_int8_name_resolves_to_openvino_ir():
