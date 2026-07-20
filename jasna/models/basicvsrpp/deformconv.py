@@ -9,6 +9,45 @@ from torch.nn import init as init
 from torch.nn.modules.utils import _pair, _single
 import math
 
+# Offset-independent grid constants per geometry (same pattern as
+# jasna.tracking.blending._KERNEL_CACHE). Values are read-only: the per-call
+# math must never apply in-place ops to them.
+_GRID_CONST_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _grid_constants(
+    H: int, W: int, Ho: int, Wo: int, kh: int, kw: int,
+    sy: int, sx: int, py: int, px: int, dy: int, dx: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cached offset-independent part of the sampling grid, in fp32.
+
+    The absolute position p = out * stride - pad + tap * dilation + offset is
+    mapped to grid_sample's align_corners=False coords g = (2p + 1)/dim - 1.
+    Everything but the offset term is geometry-only, so the normalization is
+    folded into the cached constant:
+
+        g = offset * (2/dim) + [(2 * (out*stride - pad + tap*dilation) + 1)/dim - 1]
+
+    Returned shapes broadcast directly against (B, G, K, Ho, Wo) offsets:
+    const_y is (1, 1, K, Ho, 1), const_x is (1, 1, K, 1, Wo).
+    """
+    key = (H, W, Ho, Wo, kh, kw, sy, sx, py, px, dy, dx, str(device), torch.float32)
+    cached = _GRID_CONST_CACHE.get(key)
+    if cached is None:
+        K = kh * kw
+        base_y = torch.arange(Ho, device=device, dtype=torch.float32).mul_(sy).sub_(py)
+        base_x = torch.arange(Wo, device=device, dtype=torch.float32).mul_(sx).sub_(px)
+        tap_y = torch.arange(kh, device=device, dtype=torch.float32).mul_(dy)
+        tap_x = torch.arange(kw, device=device, dtype=torch.float32).mul_(dx)
+        tap_y = tap_y.view(kh, 1).expand(kh, kw).reshape(K)
+        tap_x = tap_x.view(1, kw).expand(kh, kw).reshape(K)
+        const_y = (base_y.view(1, Ho) + tap_y.view(K, 1)).mul_(2.0).add_(1.0).div_(H).sub_(1.0)
+        const_x = (base_x.view(1, Wo) + tap_x.view(K, 1)).mul_(2.0).add_(1.0).div_(W).sub_(1.0)
+        cached = (const_y.view(1, 1, K, Ho, 1), const_x.view(1, 1, K, 1, Wo))
+        _GRID_CONST_CACHE[key] = cached
+    return cached
+
 
 def modulated_deform_conv2d_grid_sample(
     x: torch.Tensor,
@@ -43,24 +82,18 @@ def modulated_deform_conv2d_grid_sample(
     Ho = (H + 2 * py - dy * (kh - 1) - 1) // sy + 1
     Wo = (W + 2 * px - dx * (kw - 1) - 1) // sx + 1
 
-    # Absolute sampling positions per (tap, output pixel), computed in fp32:
-    # p = out * stride - pad + tap * dilation + offset. Offset channels are
-    # group-major, tap-major, (dy, dx) interleaved — torchvision's layout.
-    device = x.device
-    base_y = torch.arange(Ho, device=device, dtype=torch.float32).mul_(sy).sub_(py)
-    base_x = torch.arange(Wo, device=device, dtype=torch.float32).mul_(sx).sub_(px)
-    tap_y = torch.arange(kh, device=device, dtype=torch.float32).mul_(dy)
-    tap_x = torch.arange(kw, device=device, dtype=torch.float32).mul_(dx)
-    tap_y = tap_y.view(kh, 1).expand(kh, kw).reshape(K)
-    tap_x = tap_x.view(1, kw).expand(kh, kw).reshape(K)
-
+    # Sampling grid in fp32: normalized position = offset * (2/dim) + cached
+    # constant (base + tap + align_corners=False mapping folded in, see
+    # _grid_constants). Offset channels are group-major, tap-major, (dy, dx)
+    # interleaved — torchvision's layout.
+    const_y, const_x = _grid_constants(
+        H, W, Ho, Wo, kh, kw, sy, sx, py, px, dy, dx, x.device
+    )
     off = offset.view(B, G, K, 2, Ho, Wo).float()
-    pos_y = off[:, :, :, 0] + base_y.view(1, 1, 1, Ho, 1) + tap_y.view(1, 1, K, 1, 1)
-    pos_x = off[:, :, :, 1] + base_x.view(1, 1, 1, 1, Wo) + tap_x.view(1, 1, K, 1, 1)
-
-    # Pixel centers -> grid_sample's align_corners=False normalized coords.
-    gx = pos_x.mul_(2.0).add_(1.0).div_(W).sub_(1.0)
-    gy = pos_y.mul_(2.0).add_(1.0).div_(H).sub_(1.0)
+    # .mul() allocates fresh tensors; add_ writes into those, never into the
+    # cached constants.
+    gy = off[:, :, :, 0].mul(2.0 / H).add_(const_y)
+    gx = off[:, :, :, 1].mul(2.0 / W).add_(const_x)
     grid = torch.stack((gx, gy), dim=-1).view(B * G, K * Ho, Wo, 2).to(x.dtype)
 
     x_g = x.view(B, G, Cin // G, H, W).reshape(B * G, Cin // G, H, W)

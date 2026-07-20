@@ -12,7 +12,11 @@ import pytest
 import torch
 import torchvision
 
+import torch.nn.functional as F
+from torch.nn.modules.utils import _pair
+
 from jasna.models.basicvsrpp.deformconv import (
+    _GRID_CONST_CACHE,
     deform_conv2d_dispatch,
     modulated_deform_conv2d_grid_sample,
 )
@@ -75,6 +79,75 @@ def test_parity_with_torchvision(case):
     )
     assert got.shape == ref.shape
     torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
+
+
+def _uncached_reference(x, offset, mask, weight, bias, stride, padding, dilation, groups):
+    """The pre-cache composition, verbatim: grid built from scratch every call
+    with the un-folded normalization. Proves the cached/folded constants in
+    modulated_deform_conv2d_grid_sample reproduce the original math."""
+    B, Cin, H, W = x.shape
+    Cout, Cin_per_group, kh, kw = weight.shape
+    K = kh * kw
+    G = offset.shape[1] // (2 * K)
+    sy, sx = _pair(stride)
+    py, px = _pair(padding)
+    dy, dx = _pair(dilation)
+    Ho = (H + 2 * py - dy * (kh - 1) - 1) // sy + 1
+    Wo = (W + 2 * px - dx * (kw - 1) - 1) // sx + 1
+
+    device = x.device
+    base_y = torch.arange(Ho, device=device, dtype=torch.float32).mul_(sy).sub_(py)
+    base_x = torch.arange(Wo, device=device, dtype=torch.float32).mul_(sx).sub_(px)
+    tap_y = torch.arange(kh, device=device, dtype=torch.float32).mul_(dy)
+    tap_x = torch.arange(kw, device=device, dtype=torch.float32).mul_(dx)
+    tap_y = tap_y.view(kh, 1).expand(kh, kw).reshape(K)
+    tap_x = tap_x.view(1, kw).expand(kh, kw).reshape(K)
+
+    off = offset.view(B, G, K, 2, Ho, Wo).float()
+    pos_y = off[:, :, :, 0] + base_y.view(1, 1, 1, Ho, 1) + tap_y.view(1, 1, K, 1, 1)
+    pos_x = off[:, :, :, 1] + base_x.view(1, 1, 1, 1, Wo) + tap_x.view(1, 1, K, 1, 1)
+    gx = pos_x.mul_(2.0).add_(1.0).div_(W).sub_(1.0)
+    gy = pos_y.mul_(2.0).add_(1.0).div_(H).sub_(1.0)
+    grid = torch.stack((gx, gy), dim=-1).view(B * G, K * Ho, Wo, 2).to(x.dtype)
+
+    x_g = x.view(B, G, Cin // G, H, W).reshape(B * G, Cin // G, H, W)
+    sampled = F.grid_sample(x_g, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+    sampled = sampled.view(B, G, Cin // G, K, Ho, Wo)
+    sampled = sampled * mask.view(B, G, 1, K, Ho, Wo).to(sampled.dtype)
+    cols = sampled.reshape(B, Cin * K, Ho, Wo)
+    return F.conv2d(cols, weight.reshape(Cout, Cin_per_group * K, 1, 1), bias, groups=groups)
+
+
+@pytest.mark.parametrize("case", CASES)
+def test_cached_constants_match_uncached_math(case):
+    """Folding base + tap + normalization into cached constants only
+    reassociates float adds; agreement must be far tighter than the
+    torchvision parity tolerance."""
+    args = _random_case(**case)
+    got = modulated_deform_conv2d_grid_sample(*args)
+    ref = _uncached_reference(*args)
+    torch.testing.assert_close(got, ref, atol=1e-5, rtol=1e-5)
+
+
+def test_grid_constant_cache_hit_and_miss():
+    _GRID_CONST_CACHE.clear()
+    args = _random_case(seed=10)
+    out1 = modulated_deform_conv2d_grid_sample(*args)
+    assert len(_GRID_CONST_CACHE) == 1
+    const_y, const_x = next(iter(_GRID_CONST_CACHE.values()))
+    snap_y, snap_x = const_y.clone(), const_x.clone()
+
+    out2 = modulated_deform_conv2d_grid_sample(*args)  # identical geometry: hit
+    assert len(_GRID_CONST_CACHE) == 1
+    hit_y, hit_x = next(iter(_GRID_CONST_CACHE.values()))
+    assert hit_y is const_y and hit_x is const_x
+    torch.testing.assert_close(out1, out2, atol=0.0, rtol=0.0)
+    # Cached constants must never be mutated by the per-call math.
+    torch.testing.assert_close(const_y, snap_y, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(const_x, snap_x, atol=0.0, rtol=0.0)
+
+    modulated_deform_conv2d_grid_sample(*_random_case(stride=2, seed=11))  # miss
+    assert len(_GRID_CONST_CACHE) == 2
 
 
 def test_dispatch_env_override(monkeypatch):

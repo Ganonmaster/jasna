@@ -33,7 +33,10 @@ import torch
 import torchvision
 
 from jasna.accelerator import DEFORM_BACKEND_ENV, device_name, synchronize
-from jasna.models.basicvsrpp.deformconv import modulated_deform_conv2d_grid_sample
+from jasna.models.basicvsrpp.deformconv import (
+    _grid_constants,
+    modulated_deform_conv2d_grid_sample,
+)
 from torch.nn.modules.utils import _pair
 
 CLIP_LENGTH = 60
@@ -180,17 +183,15 @@ def _stage_breakdown(inputs, device: torch.device) -> dict[str, float]:
     Wo = (W + 2 * px - dx * (kw - 1) - 1) // sx + 1
 
     def build_grid():
-        base_y = torch.arange(Ho, device=device, dtype=torch.float32).mul_(sy).sub_(py)
-        base_x = torch.arange(Wo, device=device, dtype=torch.float32).mul_(sx).sub_(px)
-        tap_y = torch.arange(kh, device=device, dtype=torch.float32).mul_(dy)
-        tap_x = torch.arange(kw, device=device, dtype=torch.float32).mul_(dx)
-        tap_y = tap_y.view(kh, 1).expand(kh, kw).reshape(K)
-        tap_x = tap_x.view(1, kw).expand(kh, kw).reshape(K)
+        # Constants are cached across calls in production (~240 calls/clip on
+        # one geometry), so this measures the steady-state cached-path cost:
+        # dict lookup + offset scale/add + stack/cast.
+        const_y, const_x = _grid_constants(
+            H, W, Ho, Wo, kh, kw, sy, sx, py, px, dy, dx, device
+        )
         off = offset.view(B, G, K, 2, Ho, Wo).float()
-        pos_y = off[:, :, :, 0] + base_y.view(1, 1, 1, Ho, 1) + tap_y.view(1, 1, K, 1, 1)
-        pos_x = off[:, :, :, 1] + base_x.view(1, 1, 1, 1, Wo) + tap_x.view(1, 1, K, 1, 1)
-        gx = pos_x.mul_(2.0).add_(1.0).div_(W).sub_(1.0)
-        gy = pos_y.mul_(2.0).add_(1.0).div_(H).sub_(1.0)
+        gy = off[:, :, :, 0].mul(2.0 / H).add_(const_y)
+        gx = off[:, :, :, 1].mul(2.0 / W).add_(const_x)
         return torch.stack((gx, gy), dim=-1).view(B * G, K * Ho, Wo, 2).to(x.dtype)
 
     grid = build_grid()
